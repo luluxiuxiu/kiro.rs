@@ -1,3 +1,6 @@
+mod debug;
+mod test;
+
 mod kiro {
     pub mod machine_id;
     pub mod parser;
@@ -12,6 +15,16 @@ mod kiro {
 mod model {
     pub mod config;
 }
-fn main() {
-    println!("Hello, world!");
+
+use futures::StreamExt;
+
+#[tokio::main]
+async fn main() {
+    // 初始化日志
+    tracing_subscriber::fmt::init();
+
+    if let Err(e) = test::call_stream_api().await {
+        eprintln!("错误: {}", e);
+        std::process::exit(1);
+    }
 }
