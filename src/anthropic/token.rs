@@ -44,7 +44,7 @@ fn is_non_western_char(c: char) -> bool {
 /// - 4 个字符单位 = 1 token（四舍五入）
 /// ```
 pub fn count_tokens(text: &str) -> u64 {
-    println!("text: {}", text);
+    // println!("text: {}", text);
 
     let char_units: f64 = text
         .chars()
