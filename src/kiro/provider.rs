@@ -14,6 +14,12 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 
+/// 每个凭据的最大重试次数
+const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
+
+/// 总重试次数硬上限（避免无限重试）
+const MAX_TOTAL_RETRIES: usize = 9;
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -144,12 +150,18 @@ impl KiroProvider {
     }
 
     /// 内部方法：带重试逻辑的 API 调用
+    ///
+    /// 重试策略：
+    /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
+    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
+    /// - 硬上限 9 次，避免无限重试
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
-        let max_retries = self.token_manager.total_count();
+        let total_credentials = self.token_manager.total_count();
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..max_retries {
@@ -238,7 +250,14 @@ impl KiroProvider {
         }
 
         // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("API 请求失败：未知错误")))
+        let api_type = if is_stream { "流式" } else { "非流式" };
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "{} API 请求失败：已达到最大重试次数（{}次）",
+                api_type,
+                max_retries
+            )
+        }))
     }
 }
 
