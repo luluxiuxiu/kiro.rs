@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -9,7 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
-import { useCredentials } from '@/hooks/use-credentials'
+import { useCredentials, useResetAllStats } from '@/hooks/use-credentials'
 
 interface DashboardProps {
   onLogout: () => void
@@ -28,6 +28,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
+  const resetAllStats = useResetAllStats()
 
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
@@ -82,7 +83,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     <div className="min-h-screen bg-background">
       {/* 顶部导航 */}
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
+        <div className="container mx-auto flex h-14 items-center justify-between px-4 md:px-8">
           <div className="flex items-center gap-2">
             <Server className="h-5 w-5" />
             <span className="font-semibold">Kiro Admin</span>
@@ -94,6 +95,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
               <RefreshCw className="h-5 w-5" />
             </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => {
+                const ok = window.confirm('确定清空全部统计吗？此操作不可恢复。')
+                if (!ok) return
+                resetAllStats.mutate(undefined, {
+                  onSuccess: (res) => toast.success(res.message),
+                  onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                })
+              }}
+              disabled={resetAllStats.isPending}
+              title="清空全部统计"
+            >
+              <Trash2 className="h-5 w-5" />
+            </Button>
             <Button variant="ghost" size="icon" onClick={handleLogout}>
               <LogOut className="h-5 w-5" />
             </Button>
@@ -102,7 +119,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       {/* 主内容 */}
-      <main className="container px-4 md:px-8 py-6">
+      <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>

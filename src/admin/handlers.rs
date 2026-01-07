@@ -79,6 +79,39 @@ pub async fn get_credential_balance(
     }
 }
 
+/// GET /api/admin/credentials/:id/stats
+/// 获取指定凭据的统计详情
+pub async fn get_credential_stats(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_credential_stats(id) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/stats/reset
+/// 清空指定凭据统计
+pub async fn reset_credential_stats(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.reset_credential_stats(id).await {
+        Ok(()) => Json(SuccessResponse::new(format!("凭据 #{} 统计已清空", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/stats/reset
+/// 清空全部统计
+pub async fn reset_all_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.reset_all_stats().await {
+        Ok(()) => Json(SuccessResponse::new("全部统计已清空")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(

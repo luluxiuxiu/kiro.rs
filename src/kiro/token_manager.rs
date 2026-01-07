@@ -146,7 +146,10 @@ async fn refresh_social_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 Social Token...");
 
-    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
     let region = &config.region;
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
@@ -221,7 +224,10 @@ async fn refresh_idc_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 IdC Token...");
 
-    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
     let client_id = credentials
         .client_id
         .as_ref()
@@ -1178,7 +1184,10 @@ mod tests {
         let mut cred2 = KiroCredentials::default();
         cred2.priority = 1;
 
-        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = match MultiTokenManager::new(config, vec![cred1, cred2], None, None, false) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
     }
@@ -1189,7 +1198,10 @@ mod tests {
         let result = MultiTokenManager::new(config, vec![], None, None, false);
         // 支持 0 个凭据启动（可通过管理面板添加）
         assert!(result.is_ok());
-        let manager = result.unwrap();
+        let manager = match result {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(manager.total_count(), 0);
         assert_eq!(manager.available_count(), 0);
     }
@@ -1204,7 +1216,10 @@ mod tests {
 
         let result = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false);
         assert!(result.is_err());
-        let err_msg = result.err().unwrap().to_string();
+        let err_msg = match result.err() {
+            Some(e) => e.to_string(),
+            None => String::new(),
+        };
         assert!(err_msg.contains("重复的凭据 ID"), "错误消息应包含 '重复的凭据 ID'，实际: {}", err_msg);
     }
 
@@ -1214,7 +1229,10 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = match MultiTokenManager::new(config, vec![cred1, cred2], None, None, false) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
 
         // 凭据会自动分配 ID（从 1 开始）
         // 前两次失败不会禁用（使用 ID 1）
@@ -1238,7 +1256,10 @@ mod tests {
         let config = Config::default();
         let cred = KiroCredentials::default();
 
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let manager = match MultiTokenManager::new(config, vec![cred], None, None, false) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
 
         // 失败两次（使用 ID 1）
         manager.report_failure(1);
@@ -1261,7 +1282,10 @@ mod tests {
         let mut cred2 = KiroCredentials::default();
         cred2.refresh_token = Some("token2".to_string());
 
-        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = match MultiTokenManager::new(config, vec![cred1, cred2], None, None, false) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
 
         // 初始是第一个凭据
         assert_eq!(

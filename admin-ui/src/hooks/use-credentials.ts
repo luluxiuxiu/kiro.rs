@@ -6,6 +6,9 @@ import {
   resetCredentialFailure,
   getCredentialBalance,
   addCredential,
+  getCredentialStats,
+  resetCredentialStats,
+  resetAllStats,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -70,6 +73,40 @@ export function useAddCredential() {
     mutationFn: (req: AddCredentialRequest) => addCredential(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 查询指定凭据统计
+export function useCredentialStats(id: number | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['credential-stats', id],
+    queryFn: () => getCredentialStats(id!),
+    enabled: enabled && id !== null,
+    retry: false,
+  })
+}
+
+// 清空指定凭据统计
+export function useResetCredentialStats() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => resetCredentialStats(id),
+    onSuccess: (_res, id) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-stats', id] })
+    },
+  })
+}
+
+// 清空全部统计
+export function useResetAllStats() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => resetAllStats(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-stats'] })
     },
   })
 }

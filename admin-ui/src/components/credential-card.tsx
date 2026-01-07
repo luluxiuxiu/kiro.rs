@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, BarChart3, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -11,7 +11,9 @@ import {
   useSetDisabled,
   useSetPriority,
   useResetFailure,
+  useResetCredentialStats,
 } from '@/hooks/use-credentials'
+import { StatsDialog } from '@/components/stats-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -21,10 +23,12 @@ interface CredentialCardProps {
 export function CredentialCard({ credential, onViewBalance }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [statsDialogOpen, setStatsDialogOpen] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
+  const resetStats = useResetCredentialStats()
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -82,6 +86,13 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
     const hours = Math.floor(minutes / 60)
     if (hours < 24) return `${hours} 小时`
     return `${Math.floor(hours / 24)} 天`
+  }
+
+  const formatTime = (t: string | null) => {
+    if (!t) return '从未'
+    const d = new Date(t)
+    if (isNaN(d.getTime())) return t
+    return d.toLocaleString()
   }
 
   return (
@@ -166,6 +177,35 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             <span className="text-muted-foreground">Token 有效期：</span>
             <span className="font-medium">{formatExpiry(credential.expiresAt)}</span>
           </div>
+          <div className="col-span-2">
+            <span className="text-muted-foreground">调用次数：</span>
+            <span className="font-medium ml-1">总 {credential.callsTotal}</span>
+            <span className="text-green-600 font-medium ml-3">成功 {credential.callsOk}</span>
+            <span className={credential.callsErr > 0 ? 'text-red-500 font-medium ml-3' : 'font-medium ml-3'}>
+              失败 {credential.callsErr}
+            </span>
+          </div>
+          <div>
+            <span className="text-muted-foreground">累计 Tokens：</span>
+            <span className="font-medium">
+              {credential.inputTokensTotal} in / {credential.outputTokensTotal} out
+            </span>
+          </div>
+          <div className="col-span-2">
+            <span className="text-muted-foreground">最后调用：</span>
+            <span className="font-medium">{formatTime(credential.lastCallAt)}</span>
+          </div>
+          {credential.lastError && (
+            <div className="col-span-2">
+              <span className="text-muted-foreground">最后错误：</span>
+              <span className="text-red-500 font-medium">
+                {credential.lastErrorAt ? `${formatTime(credential.lastErrorAt)} - ` : ''}
+                {credential.lastError.length > 160
+                  ? credential.lastError.slice(0, 160) + '...'
+                  : credential.lastError}
+              </span>
+            </div>
+          )}
           {credential.hasProfileArn && (
             <div className="col-span-2">
               <Badge variant="secondary">有 Profile ARN</Badge>
@@ -222,6 +262,30 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
           </Button>
           <Button
             size="sm"
+            variant="outline"
+            onClick={() => setStatsDialogOpen(true)}
+          >
+            <BarChart3 className="h-4 w-4 mr-1" />
+            统计详情
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={() => {
+              const ok = window.confirm(`确定清空凭据 #${credential.id} 的统计吗？此操作不可恢复。`)
+              if (!ok) return
+              resetStats.mutate(credential.id, {
+                onSuccess: (res) => toast.success(res.message),
+                onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+              })
+            }}
+            disabled={resetStats.isPending}
+          >
+            <Trash2 className="h-4 w-4 mr-1" />
+            清空统计
+          </Button>
+          <Button
+            size="sm"
             variant="default"
             onClick={() => onViewBalance(credential.id)}
           >
@@ -229,6 +293,12 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             查看余额
           </Button>
         </div>
+
+        <StatsDialog
+          credentialId={credential.id}
+          open={statsDialogOpen}
+          onOpenChange={setStatsDialogOpen}
+        />
       </CardContent>
     </Card>
   )

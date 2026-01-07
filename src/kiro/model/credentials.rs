@@ -169,7 +169,10 @@ mod tests {
             "authMethod": "social"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.access_token, Some("test_token".to_string()));
         assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
         assert_eq!(creds.profile_arn, Some("arn:aws:test".to_string()));
@@ -184,7 +187,10 @@ mod tests {
             "unknownField": "should be ignored"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.access_token, Some("test_token".to_string()));
     }
 
@@ -202,7 +208,10 @@ mod tests {
             priority: 0,
         };
 
-        let json = creds.to_pretty_json().unwrap();
+        let json = match creds.to_pretty_json() {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(json.contains("accessToken"));
         assert!(json.contains("authMethod"));
         assert!(!json.contains("refreshToken"));
@@ -218,21 +227,30 @@ mod tests {
     #[test]
     fn test_priority_default() {
         let json = r#"{"refreshToken": "test"}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.priority, 0);
     }
 
     #[test]
     fn test_priority_explicit() {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.priority, 5);
     }
 
     #[test]
     fn test_credentials_config_single() {
         let json = r#"{"refreshToken": "test", "expiresAt": "2025-12-31T00:00:00Z"}"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let config: CredentialsConfig = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(matches!(config, CredentialsConfig::Single(_)));
         assert_eq!(config.len(), 1);
     }
@@ -243,7 +261,10 @@ mod tests {
             {"refreshToken": "test1", "priority": 1},
             {"refreshToken": "test2", "priority": 0}
         ]"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let config: CredentialsConfig = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(matches!(config, CredentialsConfig::Multiple(_)));
         assert_eq!(config.len(), 2);
     }
@@ -255,7 +276,10 @@ mod tests {
             {"refreshToken": "t2", "priority": 0},
             {"refreshToken": "t3", "priority": 1}
         ]"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let config: CredentialsConfig = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         let list = config.into_sorted_credentials();
 
         // 验证按优先级排序

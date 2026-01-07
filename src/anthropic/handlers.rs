@@ -1,6 +1,6 @@
 //! Anthropic API Handler 函数
 
-use std::convert::Infallible;
+use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     body::Body,
@@ -15,6 +15,7 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
+use crate::stats::StatsStore;
 use crate::token;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -110,6 +111,9 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidRequest(msg) => {
+                    ("invalid_request_error", msg.clone())
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -170,7 +174,10 @@ async fn handle_stream_request(
     thinking_enabled: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (credential_id, response) = match provider
+        .call_api_stream_with_credential_id(request_body, Some(model))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);
@@ -185,23 +192,39 @@ async fn handle_stream_request(
         }
     };
 
+    let stats = provider.stats_store();
+    let model = model.to_string();
+
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled);
+    let mut ctx = StreamContext::new_with_thinking(model.clone(), input_tokens, thinking_enabled);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, stats, credential_id, model);
 
     // 返回 SSE 响应
-    Response::builder()
+    match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
-        .unwrap()
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("构建 SSE 响应失败: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("构建 SSE 响应失败: {}", e),
+                )),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Ping 事件间隔（25秒）
@@ -217,6 +240,9 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    stats: Option<Arc<StatsStore>>,
+    credential_id: u64,
+    model: String,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -229,8 +255,26 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            stats,
+            credential_id,
+            model,
+        ),
+        |(
+            mut body_stream,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            stats,
+            credential_id,
+            model,
+        )| async move {
             if finished {
                 return None;
             }
@@ -267,26 +311,72 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats, credential_id, model)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            tracing::error!(
+                                message_id = %ctx.message_id,
+                                decoded_frames = decoder.frames_decoded(),
+                                decoder_buffer_len = decoder.buffer_len(),
+                                decoder_error_count = decoder.error_count(),
+                                decoder_bytes_skipped = decoder.bytes_skipped(),
+                                "读取上游响应流失败: {}",
+                                e
+                            );
                             // 发送最终事件并结束
+                            if let Some(s) = &stats {
+                                s.record_error(credential_id, Some(&model), format!("读取上游响应流失败: {}", e));
+                            }
+
                             let final_events = ctx.generate_final_events();
+
+                            // 记录用量（即使流中断，也尽量把已输出部分计入）
+                            if let Some(s) = &stats {
+                                let final_input_tokens = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+                                s.add_usage(
+                                    credential_id,
+                                    Some(&model),
+                                    final_input_tokens as i64,
+                                    ctx.output_tokens as i64,
+                                );
+                            }
+
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats, credential_id, model)))
                         }
                         None => {
                             // 流结束，发送最终事件
+                            tracing::info!(
+                                message_id = %ctx.message_id,
+                                decoded_frames = decoder.frames_decoded(),
+                                decoder_buffer_len = decoder.buffer_len(),
+                                decoder_error_count = decoder.error_count(),
+                                decoder_bytes_skipped = decoder.bytes_skipped(),
+                                "上游响应流结束（EOF）"
+                            );
+
                             let final_events = ctx.generate_final_events();
+
+                            // 正常结束：记录成功 + 用量
+                            if let Some(s) = &stats {
+                                s.record_success(credential_id, Some(&model));
+                                let final_input_tokens = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+                                s.add_usage(
+                                    credential_id,
+                                    Some(&model),
+                                    final_input_tokens as i64,
+                                    ctx.output_tokens as i64,
+                                );
+                            }
+
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats, credential_id, model)))
                         }
                     }
                 }
@@ -294,7 +384,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats, credential_id, model)))
                 }
             }
         },
@@ -315,7 +405,10 @@ async fn handle_non_stream_request(
     input_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let (credential_id, response) = match provider
+        .call_api_with_credential_id(request_body, Some(model))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);
@@ -330,11 +423,16 @@ async fn handle_non_stream_request(
         }
     };
 
+    let stats = provider.stats_store();
+
     // 读取响应体
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
+            if let Some(s) = &stats {
+                s.record_error(credential_id, Some(model), format!("读取响应体失败: {}", e));
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -446,6 +544,17 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+
+    // 记录成功 + 用量（按最终使用的凭据归集）
+    if let Some(s) = &stats {
+        s.record_success(credential_id, Some(model));
+        s.add_usage(
+            credential_id,
+            Some(model),
+            final_input_tokens as i64,
+            output_tokens as i64,
+        );
+    }
 
     // 构建 Anthropic 响应
     let response_body = json!({

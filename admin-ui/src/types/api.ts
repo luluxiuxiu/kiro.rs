@@ -16,6 +16,17 @@ export interface CredentialStatusItem {
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
+
+  // ===== 统计（可持久化） =====
+  callsTotal: number
+  callsOk: number
+  callsErr: number
+  inputTokensTotal: number
+  outputTokensTotal: number
+  lastCallAt: string | null
+  lastSuccessAt: string | null
+  lastErrorAt: string | null
+  lastError: string | null
 }
 
 // 余额响应
@@ -33,6 +44,37 @@ export interface BalanceResponse {
 export interface SuccessResponse {
   success: boolean
   message: string
+}
+
+// ===== 统计（可持久化） =====
+
+export interface StatsBucket {
+  // 按日：YYYY-MM-DD；按模型：model id
+  key: string
+  callsTotal: number
+  callsOk: number
+  callsErr: number
+  inputTokensTotal: number
+  outputTokensTotal: number
+  lastCallAt: string | null
+  lastSuccessAt: string | null
+  lastErrorAt: string | null
+  lastError: string | null
+}
+
+export interface CredentialStatsResponse {
+  id: number
+  callsTotal: number
+  callsOk: number
+  callsErr: number
+  inputTokensTotal: number
+  outputTokensTotal: number
+  lastCallAt: string | null
+  lastSuccessAt: string | null
+  lastErrorAt: string | null
+  lastError: string | null
+  byDay: StatsBucket[]
+  byModel: StatsBucket[]
 }
 
 // 错误响应

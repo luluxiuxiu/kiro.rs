@@ -6,13 +6,13 @@
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST};
 use reqwest::Client;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::http_client::{build_client, build_stream_client, ProxyConfig};
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+use crate::stats::StatsStore;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -27,23 +27,43 @@ const MAX_TOTAL_RETRIES: usize = 9;
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     client: Client,
+    stream_client: Client,
+    stats: Option<Arc<StatsStore>>,
 }
 
 impl KiroProvider {
     /// 创建新的 KiroProvider 实例
-    pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
+    pub fn new(token_manager: Arc<MultiTokenManager>) -> anyhow::Result<Self> {
         Self::with_proxy(token_manager, None)
     }
 
     /// 创建带代理配置的 KiroProvider 实例
-    pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
-        let client = build_client(proxy.as_ref(), 720) // 12 分钟超时
-            .expect("创建 HTTP 客户端失败");
+    pub fn with_proxy(
+        token_manager: Arc<MultiTokenManager>,
+        proxy: Option<ProxyConfig>,
+    ) -> anyhow::Result<Self> {
+        // 非流式请求：设置总超时，避免无限挂起
+        let client = build_client(proxy.as_ref(), 720)?; // 12 分钟
 
-        Self {
+        // 流式请求：关闭总超时，避免长响应被客户端整体 deadline 中断
+        let stream_client = build_stream_client(proxy.as_ref())?;
+
+        Ok(Self {
             token_manager,
             client,
-        }
+            stream_client,
+            stats: None,
+        })
+    }
+
+    /// 给 Provider 绑定统计存储（用于记录调用次数/用量/错误）。
+    pub fn with_stats(mut self, stats: Arc<StatsStore>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    pub fn stats_store(&self) -> Option<Arc<StatsStore>> {
+        self.stats.clone()
     }
 
     /// 获取 token_manager 的引用
@@ -95,16 +115,23 @@ impl KiroProvider {
         headers.insert("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"));
         headers.insert(
             "x-amz-user-agent",
-            HeaderValue::from_str(&x_amz_user_agent).unwrap(),
+            HeaderValue::from_str(&x_amz_user_agent)
+                .map_err(|e| anyhow::anyhow!("x-amz-user-agent header 无效: {}", e))?,
         );
         headers.insert(
             reqwest::header::USER_AGENT,
-            HeaderValue::from_str(&user_agent).unwrap(),
+            HeaderValue::from_str(&user_agent)
+                .map_err(|e| anyhow::anyhow!("User-Agent header 无效: {}", e))?,
         );
-        headers.insert(HOST, HeaderValue::from_str(&self.base_domain()).unwrap());
+        headers.insert(
+            HOST,
+            HeaderValue::from_str(&self.base_domain())
+                .map_err(|e| anyhow::anyhow!("Host header 无效: {}", e))?,
+        );
         headers.insert(
             "amz-sdk-invocation-id",
-            HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
+            HeaderValue::from_str(&Uuid::new_v4().to_string())
+                .map_err(|e| anyhow::anyhow!("amz-sdk-invocation-id header 无效: {}", e))?,
         );
         headers.insert(
             "amz-sdk-request",
@@ -112,7 +139,8 @@ impl KiroProvider {
         );
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", ctx.token))
+                .map_err(|e| anyhow::anyhow!("Authorization header 无效: {}", e))?,
         );
         headers.insert(CONNECTION, HeaderValue::from_static("close"));
 
@@ -131,7 +159,17 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        let (_id, resp) = self.call_api_with_retry(request_body, false, None).await?;
+        Ok(resp)
+    }
+
+    /// 发送非流式 API 请求，并返回最终使用的 credential_id。
+    pub async fn call_api_with_credential_id(
+        &self,
+        request_body: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<(u64, reqwest::Response)> {
+        self.call_api_with_retry(request_body, false, model).await
     }
 
     /// 发送流式 API 请求
@@ -146,7 +184,17 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+        let (_id, resp) = self.call_api_with_retry(request_body, true, None).await?;
+        Ok(resp)
+    }
+
+    /// 发送流式 API 请求，并返回最终使用的 credential_id。
+    pub async fn call_api_stream_with_credential_id(
+        &self,
+        request_body: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<(u64, reqwest::Response)> {
+        self.call_api_with_retry(request_body, true, model).await
     }
 
     /// 内部方法：带重试逻辑的 API 调用
@@ -159,7 +207,8 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+        model: Option<&str>,
+    ) -> anyhow::Result<(u64, reqwest::Response)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -169,7 +218,14 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context().await {
                 Ok(c) => c,
                 Err(e) => {
+                    tracing::warn!(
+                        "获取调用上下文失败（尝试 {}/{}）: {}",
+                        attempt + 1,
+                        max_retries,
+                        e
+                    );
                     last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
             };
@@ -178,14 +234,36 @@ impl KiroProvider {
             let headers = match self.build_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
+                    tracing::warn!(
+                        "构建请求头失败（尝试 {}/{}，credential_id={}）: {}",
+                        attempt + 1,
+                        max_retries,
+                        ctx.id,
+                        e
+                    );
+
+                    if let Some(stats) = &self.stats {
+                        stats.record_error(ctx.id, model, truncate_error(e.to_string()));
+                    }
+
                     last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
             };
 
+            if let Some(stats) = &self.stats {
+                stats.record_attempt(ctx.id, model);
+            }
+
             // 发送请求
-            let response = match self
-                .client
+            let client = if is_stream {
+                &self.stream_client
+            } else {
+                &self.client
+            };
+
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -200,6 +278,11 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+
+                    if let Some(stats) = &self.stats {
+                        stats.record_error(ctx.id, model, truncate_error(e.to_string()));
+                    }
+
                     // 网络错误，报告失败并重试（使用绑定的 id）
                     if !self.token_manager.report_failure(ctx.id) {
                         return Err(e.into());
@@ -214,13 +297,22 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok((ctx.id, response));
             }
 
-            // 400 Bad Request - 不算凭据错误，直接返回
+            // 400 Bad Request - 不算凭据错误（不影响 failover），但仍记录为该凭据的一次错误
             if status.as_u16() == 400 {
                 let body = response.text().await.unwrap_or_default();
                 let api_type = if is_stream { "流式" } else { "非流式" };
+
+                if let Some(stats) = &self.stats {
+                    stats.record_error(
+                        ctx.id,
+                        model,
+                        truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
+                    );
+                }
+
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -234,6 +326,19 @@ impl KiroProvider {
                 body
             );
 
+            if let Some(stats) = &self.stats {
+                stats.record_error(
+                    ctx.id,
+                    model,
+                    truncate_error(format!(
+                        "{} API 请求失败: {} {}",
+                        if is_stream { "流式" } else { "非流式" },
+                        status,
+                        body
+                    )),
+                );
+            }
+
             let has_available = self.token_manager.report_failure(ctx.id);
             if !has_available {
                 let api_type = if is_stream { "流式" } else { "非流式" };
@@ -245,31 +350,57 @@ impl KiroProvider {
                 );
             }
 
-            last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}",
-                if is_stream { "流式" } else { "非流式" }, status, body));
+            last_error = Some(anyhow::anyhow!(
+                "{} API 请求失败: {} {}",
+                if is_stream { "流式" } else { "非流式" },
+                status,
+                body
+            ));
+
+            // 失败后做一个小的退避，避免瞬间打满上游/本地 CPU
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
         // 所有重试都失败
         let api_type = if is_stream { "流式" } else { "非流式" };
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
+        Err(match last_error {
+            Some(e) => e,
+            None => anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
                 api_type,
                 max_retries
-            )
-        }))
+            ),
+        })
     }
+}
+
+fn truncate_error(s: String) -> String {
+    const MAX_CHARS: usize = 2000;
+    if s.chars().count() <= MAX_CHARS {
+        return s;
+    }
+    let mut out: String = s.chars().take(MAX_CHARS).collect();
+    out.push_str("...(truncated)");
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::token_manager::CallContext;
     use crate::model::config::Config;
 
+    fn must_ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        }
+    }
+
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
-        let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
-        KiroProvider::new(Arc::new(tm))
+        let tm = must_ok(MultiTokenManager::new(config, vec![credentials], None, None, false));
+        must_ok(KiroProvider::new(Arc::new(tm)))
     }
 
     #[test]
@@ -306,20 +437,30 @@ mod tests {
             credentials,
             token: "test_token".to_string(),
         };
-        let headers = provider.build_headers(&ctx).unwrap();
+        let headers = must_ok(provider.build_headers(&ctx));
 
-        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(
-            headers.get("x-amzn-codewhisperer-optout").unwrap(),
-            "true"
+            headers.get(CONTENT_TYPE).map(|v| v.as_bytes()),
+            Some("application/json".as_bytes())
         );
-        assert_eq!(headers.get("x-amzn-kiro-agent-mode").unwrap(), "vibe");
-        assert!(headers
-            .get(AUTHORIZATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("Bearer "));
-        assert_eq!(headers.get(CONNECTION).unwrap(), "close");
+        assert_eq!(
+            headers.get("x-amzn-codewhisperer-optout").map(|v| v.as_bytes()),
+            Some("true".as_bytes())
+        );
+        assert_eq!(
+            headers.get("x-amzn-kiro-agent-mode").map(|v| v.as_bytes()),
+            Some("vibe".as_bytes())
+        );
+
+        let auth = match headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+            Some(s) => s,
+            None => "",
+        };
+        assert!(auth.starts_with("Bearer "));
+
+        assert_eq!(
+            headers.get(CONNECTION).map(|v| v.as_bytes()),
+            Some("close".as_bytes())
+        );
     }
 }

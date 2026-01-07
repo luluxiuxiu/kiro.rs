@@ -941,7 +941,10 @@ mod tests {
             .iter()
             .any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "text"));
 
-        let initial_text_index = ctx.text_block_index.expect("initial text block index should exist");
+        let initial_text_index = match ctx.text_block_index {
+            Some(v) => v,
+            None => panic!("initial text block index should exist"),
+        };
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -968,8 +971,12 @@ mod tests {
             }
         });
         assert!(new_text_start_index.is_some(), "should start a new text block");
+        let new_text_start_index = match new_text_start_index {
+            Some(v) => v,
+            None => panic!("should start a new text block"),
+        };
         assert_ne!(
-            new_text_start_index.unwrap(),
+            new_text_start_index,
             initial_text_index as i64,
             "new text block index should differ from the stopped one"
         );
@@ -1034,9 +1041,18 @@ mod tests {
         assert!(pos_text_stop.is_some(), "should stop text block before tool_use block starts");
         assert!(pos_tool_start.is_some(), "should start tool_use block");
 
-        let pos_text_delta = pos_text_delta.unwrap();
-        let pos_text_stop = pos_text_stop.unwrap();
-        let pos_tool_start = pos_tool_start.unwrap();
+        let pos_text_delta = match pos_text_delta {
+            Some(v) => v,
+            None => panic!("should flush buffered text as text_delta"),
+        };
+        let pos_text_stop = match pos_text_stop {
+            Some(v) => v,
+            None => panic!("should stop text block before tool_use block starts"),
+        };
+        let pos_tool_start = match pos_tool_start {
+            Some(v) => v,
+            None => panic!("should start tool_use block"),
+        };
 
         assert!(
             pos_text_delta < pos_text_stop && pos_text_stop < pos_tool_start,
