@@ -17,9 +17,15 @@ interface BalanceDialogProps {
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
 
-  const formatDate = (timestamp: number | null) => {
-    if (!timestamp) return '未知'
-    return new Date(timestamp * 1000).toLocaleString('zh-CN')
+  const formatDate = (dateStr: string | null) => {
+    if (!dateStr) return '未知'
+    const date = new Date(dateStr)
+    if (isNaN(date.getTime())) return '未知'
+    return date.toLocaleDateString('zh-CN', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    })
   }
 
   const formatNumber = (num: number) => {

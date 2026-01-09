@@ -39,7 +39,7 @@ export interface BalanceResponse {
   usageLimit: number
   remaining: number
   usagePercentage: number
-  nextResetAt: number | null
+  nextResetAt: string | null
 }
 
 // 成功响应
