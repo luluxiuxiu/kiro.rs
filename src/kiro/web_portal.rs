@@ -94,6 +94,45 @@ mod cbor_timestamp {
     }
 }
 
+/// 自定义反序列化器：处理 CBOR 整数或浮点数，统一转换为 f64
+///
+/// CBOR 中数值可能是整数（Integer）或浮点数（Float），
+/// 此反序列化器支持两种格式并统一转换为 f64
+mod cbor_number {
+    use super::*;
+
+    /// 反序列化 CBOR 数值为 Option<f64>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value: Option<ciborium::Value> = Option::deserialize(deserializer)?;
+
+        match value {
+            None => Ok(None),
+            Some(v) => match convert_to_f64(&v) {
+                Some(n) => Ok(Some(n)),
+                None => {
+                    tracing::warn!("[CBOR] 无法解析数值: {:?}", v);
+                    Ok(None)
+                }
+            },
+        }
+    }
+
+    /// 将 ciborium::Value 转换为 f64
+    fn convert_to_f64(value: &ciborium::Value) -> Option<f64> {
+        match value {
+            ciborium::Value::Float(f) => Some(*f),
+            ciborium::Value::Integer(i) => {
+                let n: i128 = (*i).into();
+                Some(n as f64)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetUserInfoRequest {
@@ -140,9 +179,13 @@ pub struct Bonus {
     pub bonus_code: Option<String>,
     pub display_name: Option<String>,
 
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub usage_limit: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub usage_limit_with_precision: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub current_usage: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub current_usage_with_precision: Option<f64>,
 
     pub status: Option<String>,
@@ -153,9 +196,13 @@ pub struct Bonus {
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FreeTrialInfo {
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub usage_limit: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub usage_limit_with_precision: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub current_usage: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub current_usage_with_precision: Option<f64>,
 
     #[serde(default, deserialize_with = "cbor_timestamp::deserialize")]
@@ -168,16 +215,22 @@ pub struct FreeTrialInfo {
 pub struct UsageBreakdownItem {
     pub resource_type: Option<String>,
 
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub current_usage: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub current_usage_with_precision: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub usage_limit: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub usage_limit_with_precision: Option<f64>,
 
     pub display_name: Option<String>,
     pub display_name_plural: Option<String>,
     pub currency: Option<String>,
     pub unit: Option<String>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub overage_rate: Option<f64>,
+    #[serde(default, deserialize_with = "cbor_number::deserialize")]
     pub overage_cap: Option<f64>,
 
     pub free_trial_info: Option<FreeTrialInfo>,
@@ -700,5 +753,235 @@ pub fn aggregate_account_info(
             })
             .unwrap_or_default(),
         raw_usage: usage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 集成测试：使用真实 refreshToken 测试 API 请求
+    ///
+    /// 此测试需要有效的凭据文件，运行方式：
+    /// ```
+    /// cargo test --package kiro-rs test_get_user_usage_and_limits_real -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore] // 需要真实凭据，默认跳过
+    async fn test_get_user_usage_and_limits_real() {
+        // 初始化日志
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        // 从凭据文件读取
+        let creds_path = std::path::Path::new("../credentials.json");
+        if !creds_path.exists() {
+            println!("跳过测试：凭据文件不存在 {:?}", creds_path);
+            return;
+        }
+
+        let creds_content = std::fs::read_to_string(creds_path)
+            .expect("读取凭据文件失败");
+        let creds: Vec<crate::kiro::model::credentials::KiroCredentials> =
+            serde_json::from_str(&creds_content).expect("解析凭据文件失败");
+
+        if creds.is_empty() {
+            println!("跳过测试：凭据文件为空");
+            return;
+        }
+
+        // 使用第一个凭据
+        let cred = &creds[0];
+        let access_token = cred.access_token.as_ref().expect("缺少 accessToken");
+
+        // 尝试多个 IDP
+        let idps = ["Github", "Google", "BuilderId"];
+        let mut success = false;
+
+        for idp in idps {
+            println!("\n尝试 IDP: {}", idp);
+            match get_user_usage_and_limits(access_token, idp, None).await {
+                Ok(response) => {
+                    println!("成功获取用量信息！");
+                    println!("订阅信息: {:?}", response.subscription_info);
+                    println!("用量明细数量: {:?}", response.usage_breakdown_list.as_ref().map(|l| l.len()));
+                    println!("下次重置时间: {:?}", response.next_date_reset);
+
+                    // 打印用户信息
+                    println!("用户信息: {:?}", response.user_info);
+
+                    if let Some(breakdown) = response.usage_breakdown_list.as_ref() {
+                        for item in breakdown {
+                            println!("\n资源类型: {:?}", item.resource_type);
+                            println!("  当前用量: {:?}", item.current_usage);
+                            println!("  用量限制: {:?}", item.usage_limit);
+                            println!("  下次重置: {:?}", item.next_date_reset);
+                            if let Some(bonuses) = &item.bonuses {
+                                for bonus in bonuses {
+                                    println!("  奖励: {:?} - 当前: {:?}, 限制: {:?}, 过期: {:?}",
+                                        bonus.display_name, bonus.current_usage, bonus.usage_limit, bonus.expires_at);
+                                }
+                            }
+                        }
+                    }
+
+                    success = true;
+                    break;
+                }
+                Err(e) => {
+                    println!("IDP {} 失败: {}", idp, e);
+                }
+            }
+        }
+
+        assert!(success, "所有 IDP 都失败了");
+    }
+
+    /// 测试 CBOR 时间戳反序列化
+    #[test]
+    fn test_cbor_timestamp_deserialize() {
+        // 模拟 CBOR Tag(1) 时间戳
+        let timestamp = 1769904000.0_f64;
+        let value = ciborium::Value::Tag(1, Box::new(ciborium::Value::Float(timestamp)));
+
+        // 序列化为 CBOR
+        let mut buf = Vec::new();
+        ciborium::into_writer(&value, &mut buf).expect("CBOR 编码失败");
+
+        // 反序列化
+        let decoded: ciborium::Value = ciborium::from_reader(&buf[..]).expect("CBOR 解码失败");
+
+        // 验证
+        match decoded {
+            ciborium::Value::Tag(1, inner) => {
+                if let ciborium::Value::Float(f) = *inner {
+                    assert!((f - timestamp).abs() < 0.001);
+                } else {
+                    panic!("期望 Float，得到 {:?}", inner);
+                }
+            }
+            _ => panic!("期望 Tag(1, ...)，得到 {:?}", decoded),
+        }
+    }
+
+    /// 测试 CBOR 整数到浮点数转换
+    #[test]
+    fn test_cbor_number_deserialize() {
+        // 测试整数
+        let int_value = ciborium::Value::Integer(42.into());
+        let mut buf = Vec::new();
+        ciborium::into_writer(&int_value, &mut buf).expect("CBOR 编码失败");
+        let decoded: ciborium::Value = ciborium::from_reader(&buf[..]).expect("CBOR 解码失败");
+        match decoded {
+            ciborium::Value::Integer(i) => {
+                let n: i128 = i.into();
+                assert_eq!(n, 42);
+            }
+            _ => panic!("期望 Integer，得到 {:?}", decoded),
+        }
+
+        // 测试浮点数
+        let float_value = ciborium::Value::Float(3.14);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&float_value, &mut buf).expect("CBOR 编码失败");
+        let decoded: ciborium::Value = ciborium::from_reader(&buf[..]).expect("CBOR 解码失败");
+        match decoded {
+            ciborium::Value::Float(f) => {
+                assert!((f - 3.14).abs() < 0.001);
+            }
+            _ => panic!("期望 Float，得到 {:?}", decoded),
+        }
+    }
+
+    /// 测试 UsageAndLimitsResponse 反序列化（使用模拟数据）
+    #[test]
+    fn test_usage_response_deserialize() {
+        // 构建模拟的 CBOR 响应（类似 API 返回的格式）
+        // 使用 Vec 而不是 BTreeMap，因为 ciborium::Value 不实现 Ord
+        let mut response_entries: Vec<(ciborium::Value, ciborium::Value)> = Vec::new();
+
+        // nextDateReset: Tag(1, Float)
+        response_entries.push((
+            ciborium::Value::Text("nextDateReset".to_string()),
+            ciborium::Value::Tag(1, Box::new(ciborium::Value::Float(1769904000.0))),
+        ));
+
+        // subscriptionInfo
+        let sub_info_entries: Vec<(ciborium::Value, ciborium::Value)> = vec![
+            (
+                ciborium::Value::Text("subscriptionTitle".to_string()),
+                ciborium::Value::Text("KIRO FREE".to_string()),
+            ),
+            (
+                ciborium::Value::Text("type".to_string()),
+                ciborium::Value::Text("Q_DEVELOPER_STANDALONE_FREE".to_string()),
+            ),
+        ];
+        response_entries.push((
+            ciborium::Value::Text("subscriptionInfo".to_string()),
+            ciborium::Value::Map(sub_info_entries),
+        ));
+
+        // usageBreakdownList
+        let breakdown_entries: Vec<(ciborium::Value, ciborium::Value)> = vec![
+            (
+                ciborium::Value::Text("resourceType".to_string()),
+                ciborium::Value::Text("CREDIT".to_string()),
+            ),
+            // 整数类型的 currentUsage
+            (
+                ciborium::Value::Text("currentUsage".to_string()),
+                ciborium::Value::Integer(0.into()),
+            ),
+            // 整数类型的 usageLimit
+            (
+                ciborium::Value::Text("usageLimit".to_string()),
+                ciborium::Value::Integer(50.into()),
+            ),
+            // 浮点数类型的 usageLimitWithPrecision
+            (
+                ciborium::Value::Text("usageLimitWithPrecision".to_string()),
+                ciborium::Value::Float(50.0),
+            ),
+            // nextDateReset in breakdown
+            (
+                ciborium::Value::Text("nextDateReset".to_string()),
+                ciborium::Value::Tag(1, Box::new(ciborium::Value::Float(1769904000.0))),
+            ),
+        ];
+
+        response_entries.push((
+            ciborium::Value::Text("usageBreakdownList".to_string()),
+            ciborium::Value::Array(vec![ciborium::Value::Map(breakdown_entries)]),
+        ));
+
+        // 序列化为 CBOR
+        let cbor_value = ciborium::Value::Map(response_entries);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&cbor_value, &mut buf).expect("CBOR 编码失败");
+
+        // 反序列化为 UsageAndLimitsResponse
+        let response: UsageAndLimitsResponse =
+            ciborium::from_reader(&buf[..]).expect("反序列化失败");
+
+        // 验证
+        assert!(response.next_date_reset.is_some());
+        let next_reset = response.next_date_reset.as_ref().expect("next_date_reset 为空");
+        assert!(next_reset.contains("2026"), "时间戳应该转换为 2026 年的日期: {}", next_reset);
+
+        assert!(response.subscription_info.is_some());
+        let sub = response.subscription_info.as_ref().expect("subscription_info 为空");
+        assert_eq!(sub.subscription_title, Some("KIRO FREE".to_string()));
+
+        assert!(response.usage_breakdown_list.is_some());
+        let breakdown_list = response.usage_breakdown_list.as_ref().expect("usage_breakdown_list 为空");
+        assert_eq!(breakdown_list.len(), 1);
+
+        let item = &breakdown_list[0];
+        assert_eq!(item.resource_type, Some("CREDIT".to_string()));
+        assert_eq!(item.current_usage, Some(0.0)); // 整数 0 应该转换为 0.0
+        assert_eq!(item.usage_limit, Some(50.0)); // 整数 50 应该转换为 50.0
+        assert!(item.next_date_reset.is_some());
     }
 }
