@@ -1,6 +1,7 @@
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -34,6 +35,9 @@ export function StatsDialog({ credentialId, open, onOpenChange }: StatsDialogPro
       <DialogContent className="sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>凭据 #{credentialId} 统计详情</DialogTitle>
+          <DialogDescription className="sr-only">
+            查看凭据的调用统计和使用情况
+          </DialogDescription>
         </DialogHeader>
 
         {isLoading && (

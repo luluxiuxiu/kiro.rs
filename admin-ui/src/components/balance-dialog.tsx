@@ -1,6 +1,7 @@
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -39,6 +40,9 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
           <DialogTitle>
             凭据 #{credentialId} 余额信息
           </DialogTitle>
+          <DialogDescription className="sr-only">
+            查看凭据的使用额度和剩余余额
+          </DialogDescription>
         </DialogHeader>
 
         {isLoading && (
