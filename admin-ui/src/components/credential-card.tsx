@@ -264,96 +264,109 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
           </div>
 
           {/* 操作按钮 */}
-          <div className="flex flex-wrap gap-2 pt-2 border-t">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleReset}
-              disabled={resetFailure.isPending || credential.failureCount === 0}
-            >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              重置失败
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                const newPriority = Math.max(0, credential.priority - 1)
-                setPriority.mutate(
-                  { id: credential.id, priority: newPriority },
-                  {
+          <div className="pt-3 border-t space-y-2">
+            {/* 第一行：常规操作 */}
+            <div className="grid grid-cols-4 gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={handleReset}
+                disabled={resetFailure.isPending || credential.failureCount === 0}
+              >
+                <RefreshCw className="h-4 w-4 mr-1" />
+                重置失败
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={() => {
+                  const newPriority = Math.max(0, credential.priority - 1)
+                  setPriority.mutate(
+                    { id: credential.id, priority: newPriority },
+                    {
+                      onSuccess: (res) => toast.success(res.message),
+                      onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                    }
+                  )
+                }}
+                disabled={setPriority.isPending || credential.priority === 0}
+              >
+                <ChevronUp className="h-4 w-4 mr-1" />
+                提高优先级
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={() => {
+                  const newPriority = credential.priority + 1
+                  setPriority.mutate(
+                    { id: credential.id, priority: newPriority },
+                    {
+                      onSuccess: (res) => toast.success(res.message),
+                      onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                    }
+                  )
+                }}
+                disabled={setPriority.isPending}
+              >
+                <ChevronDown className="h-4 w-4 mr-1" />
+                降低优先级
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={() => setStatsDialogOpen(true)}
+              >
+                <BarChart3 className="h-4 w-4 mr-1" />
+                统计详情
+              </Button>
+            </div>
+            {/* 第二行：危险操作 + 查看余额 */}
+            <div className="grid grid-cols-3 gap-2">
+              <Button
+                size="sm"
+                variant="destructive"
+                className="w-full"
+                onClick={() => setShowDeleteDialog(true)}
+                disabled={deleteCredential.isPending}
+              >
+                <Trash className="h-4 w-4 mr-1" />
+                删除凭据
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                className="w-full"
+                onClick={() => {
+                  const ok = window.confirm(`确定清空凭据 #${credential.id} 的统计吗？此操作不可恢复。`)
+                  if (!ok) return
+                  resetStats.mutate(credential.id, {
                     onSuccess: (res) => toast.success(res.message),
                     onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                  }
-                )
-              }}
-              disabled={setPriority.isPending || credential.priority === 0}
-            >
-              <ChevronUp className="h-4 w-4 mr-1" />
-              提高优先级
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                const newPriority = credential.priority + 1
-                setPriority.mutate(
-                  { id: credential.id, priority: newPriority },
-                  {
-                    onSuccess: (res) => toast.success(res.message),
-                    onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                  }
-                )
-              }}
-              disabled={setPriority.isPending}
-            >
-              <ChevronDown className="h-4 w-4 mr-1" />
-              降低优先级
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => setStatsDialogOpen(true)}
-            >
-              <BarChart3 className="h-4 w-4 mr-1" />
-              统计详情
-            </Button>
-            <Button
-              size="sm"
-              variant="destructive"
-              onClick={() => setShowDeleteDialog(true)}
-              disabled={deleteCredential.isPending}
-            >
-              <Trash className="h-4 w-4 mr-1" />
-              删除凭据
-            </Button>
-            <Button
-              size="sm"
-              variant="destructive"
-              onClick={() => {
-                const ok = window.confirm(`确定清空凭据 #${credential.id} 的统计吗？此操作不可恢复。`)
-                if (!ok) return
-                resetStats.mutate(credential.id, {
-                  onSuccess: (res) => toast.success(res.message),
-                  onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                })
-              }}
-              disabled={resetStats.isPending}
-            >
-              <Trash2 className="h-4 w-4 mr-1" />
-              清空统计
-            </Button>
-            <Button
-              size="sm"
-              variant="default"
-              onClick={() => {
-                void balanceQuery.refetch()
-                onViewBalance(credential.id)
-              }}
-            >
-              <Wallet className="h-4 w-4 mr-1" />
-              查看余额
-            </Button>
+                  })
+                }}
+                disabled={resetStats.isPending}
+              >
+                <Trash2 className="h-4 w-4 mr-1" />
+                清空统计
+              </Button>
+              <Button
+                size="sm"
+                variant="default"
+                className="w-full"
+                onClick={() => {
+                  void balanceQuery.refetch()
+                  onViewBalance(credential.id)
+                }}
+              >
+                <Wallet className="h-4 w-4 mr-1" />
+                查看余额
+              </Button>
+            </div>
           </div>
 
           <StatsDialog
