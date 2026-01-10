@@ -308,9 +308,31 @@ fn create_sse_stream(
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                        let message_type = frame
+                                            .message_type()
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        let event_type = frame
+                                            .event_type()
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        let payload_len = frame.payload.len();
+
+                                        match Event::from_frame(frame) {
+                                            Ok(event) => {
+                                                let sse_events = ctx.process_kiro_event(&event);
+                                                events.extend(sse_events);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    message_id = %ctx.message_id,
+                                                    message_type = %message_type,
+                                                    event_type = %event_type,
+                                                    payload_len = payload_len,
+                                                    "解析上游事件失败: {}",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -474,17 +496,29 @@ async fn handle_non_stream_request(
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // 工具名称缓存 (tool_use_id -> tool_name)
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
+                let message_type = frame.message_type().unwrap_or("unknown").to_string();
+                let event_type = frame.event_type().unwrap_or("unknown").to_string();
+                let payload_len = frame.payload.len();
+
+                match Event::from_frame(frame) {
+                    Ok(event) => match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
+
+                            // 缓存工具名称
+                            if !tool_use.name.is_empty() {
+                                tool_names.insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
+                            }
 
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
@@ -503,10 +537,17 @@ async fn handle_non_stream_request(
                                         serde_json::json!({})
                                     });
 
+                                // 获取工具名称（优先使用当前事件的 name，否则从缓存获取）
+                                let tool_name = if !tool_use.name.is_empty() {
+                                    tool_use.name.clone()
+                                } else {
+                                    tool_names.get(&tool_use.tool_use_id).cloned().unwrap_or_default()
+                                };
+
                                 tool_uses.push(json!({
                                     "type": "tool_use",
                                     "id": tool_use.tool_use_id,
-                                    "name": tool_use.name,
+                                    "name": tool_name,
                                     "input": input
                                 }));
                             }
@@ -531,6 +572,17 @@ async fn handle_non_stream_request(
                             }
                         }
                         _ => {}
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            credential_id = credential_id,
+                            model = %model,
+                            message_type = %message_type,
+                            event_type = %event_type,
+                            payload_len = payload_len,
+                            "解析上游事件失败: {}",
+                            e
+                        );
                     }
                 }
             }
