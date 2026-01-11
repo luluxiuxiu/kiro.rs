@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -238,7 +239,34 @@ pub(crate) async fn refresh_token(
     let auth_method = credentials.auth_method.as_deref().unwrap_or("social");
 
     match auth_method.to_lowercase().as_str() {
-        "idc" | "builder-id" => refresh_idc_token(credentials, config, proxy).await,
+        "idc" | "builder-id" => {
+            let mut new_credentials = refresh_idc_token(credentials, config, proxy).await?;
+
+            // 仅当 profile_arn 为空时才调用 ListAvailableProfiles（降级：失败/空列表不阻断刷新）
+            if new_credentials.profile_arn.is_none() {
+                let token = new_credentials
+                    .access_token
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("刷新 IdC Token 成功但缺少 accessToken"))?;
+
+                match list_available_profiles(&new_credentials, config, token, proxy).await {
+                    Ok(Some(profile_arn)) => {
+                        tracing::info!("成功获取 IdC profileArn");
+                        new_credentials.profile_arn = Some(profile_arn);
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "ListAvailableProfiles 返回空 profiles（或无可用 arn），跳过写入 profileArn"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("获取 profileArn 失败（不影响 IdC Token 刷新结果）: {}", e);
+                    }
+                }
+            }
+
+            Ok(new_credentials)
+        }
         _ => refresh_social_token(credentials, config, proxy).await,
     }
 }
@@ -395,6 +423,141 @@ async fn refresh_idc_token(
     }
 
     Ok(new_credentials)
+}
+
+/// ListAvailableProfiles API 所需的 x-amz-user-agent header 前缀
+const LIST_PROFILES_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-js/1.0.0";
+
+/// 最大分页请求次数（防止无限循环）
+const LIST_PROFILES_MAX_PAGES: usize = 5;
+
+/// 错误响应 body 最大长度（用于日志截断）
+const ERROR_BODY_MAX_LEN: usize = 2048;
+
+/// 调用 ListAvailableProfiles API 获取可用的 profileArn（用于 IdC/builder-id 凭证）
+///
+/// - 支持分页：循环请求直到找到第一个非空 arn 或 nextToken 为空
+/// - profiles 为空/无 arn 时返回 Ok(None)（降级，不阻断调用方流程）
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    access_token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+
+    tracing::debug!("正在获取可用 Profiles...");
+
+    let region = &config.region;
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = format!("https://{}/ListAvailableProfiles", host);
+
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    // 构建 User-Agent headers（按抓包格式）
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!(
+        "{} KiroIDE-{}-{}",
+        LIST_PROFILES_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
+    );
+
+    let client = build_client(proxy, 60)?;
+
+    let mut next_token: Option<String> = None;
+    let mut total_profiles = 0usize;
+
+    // 分页循环
+    for page in 0..LIST_PROFILES_MAX_PAGES {
+        // 构建请求 body（带或不带 nextToken）
+        let body = match &next_token {
+            Some(token) => serde_json::json!({ "nextToken": token }),
+            None => serde_json::json!({}),
+        };
+
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("User-Agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Connection", "close")
+            .json(&body)
+            .send()
+            .await
+            .context("发送 ListAvailableProfiles 请求失败")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = match response.text().await {
+                Ok(t) => truncate_string(&t, ERROR_BODY_MAX_LEN),
+                Err(e) => format!("<读取响应 body 失败: {}>", e),
+            };
+            let error_msg = match status.as_u16() {
+                401 => "认证失败，Token 无效或已过期",
+                403 => "权限不足，无法获取可用 Profiles",
+                429 => "请求过于频繁，已被限流",
+                500..=599 => "服务器错误，AWS 服务暂时不可用",
+                _ => "获取可用 Profiles 失败",
+            };
+            bail!("{}: {} {}", error_msg, status, body_text);
+        }
+
+        let data: ListAvailableProfilesResponse = response
+            .json()
+            .await
+            .context("解析 ListAvailableProfiles 响应失败")?;
+
+        let profiles = data.profiles.unwrap_or_default();
+        total_profiles += profiles.len();
+
+        // 查找第一个非空 arn
+        let arn = profiles
+            .into_iter()
+            .filter_map(|p| p.arn)
+            .map(|s| s.trim().to_string())
+            .find(|arn| !arn.is_empty());
+
+        if let Some(selected_arn) = arn {
+            tracing::debug!(
+                "从 {} 个 profiles（第 {} 页）中选择了 arn: {}...{}",
+                total_profiles,
+                page + 1,
+                &selected_arn[..20.min(selected_arn.len())],
+                &selected_arn[selected_arn.len().saturating_sub(10)..]
+            );
+            return Ok(Some(selected_arn));
+        }
+
+        // 检查是否有下一页
+        next_token = data.next_token.filter(|t| !t.trim().is_empty());
+        if next_token.is_none() {
+            break;
+        }
+
+        tracing::debug!("第 {} 页无可用 arn，继续翻页...", page + 1);
+    }
+
+    tracing::debug!("共检查 {} 个 profiles，无可用 arn", total_profiles);
+    Ok(None)
+}
+
+/// 截断字符串到指定长度
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...(truncated)", &s[..max_len])
+    }
 }
 
 /// getUsageLimits API 所需的 x-amz-user-agent header 前缀
