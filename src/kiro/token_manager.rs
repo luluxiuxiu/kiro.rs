@@ -2196,4 +2196,199 @@ mod tests {
             }
         }
     }
+
+    /// 测试 IdC 凭据发送"你好"请求
+    /// 打印完整的请求信息以便调试 403 错误
+    #[tokio::test]
+    #[ignore] // 需要有效的 IdC 凭据才能运行，使用 cargo test -- --ignored 运行
+    async fn test_idc_send_hello_request() {
+        use crate::http_client::build_client;
+        use crate::kiro::machine_id;
+        use crate::kiro::model::requests::conversation::{
+            ConversationState, CurrentMessage, UserInputMessage,
+        };
+        use crate::kiro::model::requests::kiro::KiroRequest;
+        use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderValue};
+        use std::path::Path;
+
+        // 从外部文件加载凭据
+        let credentials_path = Path::new(r"F:\working_ai\kiro2api-cc\credentials.json");
+        if !credentials_path.exists() {
+            println!("凭据文件不存在，跳过测试");
+            return;
+        }
+
+        let content = std::fs::read_to_string(credentials_path).expect("读取凭据文件失败");
+        let credentials_list: Vec<KiroCredentials> =
+            serde_json::from_str(&content).expect("解析凭据文件失败");
+
+        // 找到 IdC 凭据（id=14 或 id=15）
+        let idc_credentials: Vec<_> = credentials_list
+            .iter()
+            .filter(|c| {
+                c.auth_method
+                    .as_ref()
+                    .map(|m| m.to_lowercase() == "idc")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if idc_credentials.is_empty() {
+            println!("未找到 IdC 凭据，跳过测试");
+            return;
+        }
+
+        println!("找到 {} 个 IdC 凭据", idc_credentials.len());
+
+        let config = Config::default();
+
+        for cred in idc_credentials {
+            let id = cred.id.unwrap_or(0);
+            println!("\n========================================");
+            println!("测试凭据 #{}", id);
+            println!("========================================");
+
+            // 先刷新 Token
+            let refreshed_cred = match refresh_idc_token(cred, &config, None).await {
+                Ok(c) => {
+                    println!("Token 刷新成功");
+                    c
+                }
+                Err(e) => {
+                    println!("Token 刷新失败: {}", e);
+                    continue;
+                }
+            };
+
+            let access_token = match refreshed_cred.access_token.as_ref() {
+                Some(t) => t,
+                None => {
+                    println!("刷新后无 accessToken");
+                    continue;
+                }
+            };
+
+            // 构建请求 - 使用 Kiro 的模型 ID 格式
+            let model_ids = [
+                "simple-task",           // 简单任务/意图分类
+                "claude-sonnet-4.5",     // Sonnet 模型
+                "claude-opus-4.5",       // Opus 模型
+                "claude-haiku-4.5",      // Haiku 模型
+            ];
+
+            for model_id in model_ids {
+                println!("\n--- 尝试模型: {} ---", model_id);
+
+                let conversation_id = uuid::Uuid::new_v4().to_string();
+                let user_message = UserInputMessage::new("你好", model_id)
+                    .with_origin("AI_EDITOR");
+                let current_message = CurrentMessage::new(user_message);
+                let conversation_state = ConversationState::new(&conversation_id)
+                    .with_agent_task_type("vibe")
+                    .with_chat_trigger_type("MANUAL")
+                    .with_current_message(current_message);
+
+                let request = KiroRequest {
+                    conversation_state,
+                    profile_arn: refreshed_cred.profile_arn.clone(),
+                };
+
+                let request_body = serde_json::to_string_pretty(&request).expect("序列化请求失败");
+
+                // 构建请求头
+                let machine_id = machine_id::generate_from_credentials(&refreshed_cred, &config)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let kiro_version = &config.kiro_version;
+                let os_name = &config.system_version;
+                let node_version = &config.node_version;
+
+                let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
+                let user_agent = format!(
+                    "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
+                    os_name, node_version, kiro_version, machine_id
+                );
+
+                let region = &config.region;
+                let url = format!("https://q.{}.amazonaws.com/generateAssistantResponse", region);
+                let host = format!("q.{}.amazonaws.com", region);
+
+                // 打印请求信息
+                println!("\n--- 请求 URL ---");
+                println!("{}", url);
+
+                println!("\n--- 请求头 ---");
+                println!("Content-Type: application/json");
+                println!("Host: {}", host);
+                println!("x-amzn-codewhisperer-optout: true");
+                println!("x-amzn-kiro-agent-mode: vibe");
+                println!("x-amz-user-agent: {}", x_amz_user_agent);
+                println!("User-Agent: {}", user_agent);
+                println!("amz-sdk-invocation-id: <uuid>");
+                println!("amz-sdk-request: attempt=1; max=3");
+                println!("Authorization: Bearer {}...", &access_token[..50.min(access_token.len())]);
+                println!("Connection: close");
+
+                println!("\n--- 请求体 ---");
+                println!("{}", request_body);
+
+                println!("\n--- profileArn ---");
+                println!("{:?}", refreshed_cred.profile_arn);
+
+                // 发送请求
+                let client = build_client(None, 60).expect("构建 HTTP Client 失败");
+
+                let response = client
+                    .post(&url)
+                    .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                    .header("x-amzn-codewhisperer-optout", HeaderValue::from_static("true"))
+                    .header("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"))
+                    .header("x-amz-user-agent", HeaderValue::from_str(&x_amz_user_agent).expect("header"))
+                    .header(reqwest::header::USER_AGENT, HeaderValue::from_str(&user_agent).expect("header"))
+                    .header(HOST, HeaderValue::from_str(&host).expect("header"))
+                    .header("amz-sdk-invocation-id", HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()).expect("header"))
+                    .header("amz-sdk-request", HeaderValue::from_static("attempt=1; max=3"))
+                    .header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", access_token)).expect("header"))
+                    .header(CONNECTION, HeaderValue::from_static("close"))
+                    .body(request_body.clone())
+                    .send()
+                    .await;
+
+                match response {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        println!("\n--- 响应状态 ---");
+                        println!("{}", status);
+
+                        println!("\n--- 响应头 ---");
+                        for (name, value) in resp.headers() {
+                            println!("{}: {:?}", name, value);
+                        }
+
+                        let body = resp.text().await.unwrap_or_default();
+                        println!("\n--- 响应体 ---");
+                        println!("{}", body);
+
+                        // 如果成功，跳出循环
+                        if status.is_success() {
+                            println!("\n!!! 成功 !!!");
+                            break;
+                        }
+
+                        if status.as_u16() == 403 {
+                            println!("\n!!! 403 错误分析 !!!");
+                            println!("可能原因:");
+                            println!("1. profileArn 不正确或缺失");
+                            println!("2. accessToken 权限不足");
+                            println!("3. 请求头格式不正确");
+                            println!("4. IdC 凭据需要特殊的 profileArn");
+                        }
+                    }
+                    Err(e) => {
+                        println!("\n--- 请求失败 ---");
+                        println!("{}", e);
+                    }
+                }
+            } // end for model_id
+        }
+    }
 }
