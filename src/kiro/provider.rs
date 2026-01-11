@@ -212,6 +212,9 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
+    ///
+    /// 注意：此方法会自动将当前凭据的 profileArn 注入到请求体中，
+    /// 确保 IdC 凭据能够正确使用其对应的 profileArn。
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -242,6 +245,28 @@ impl KiroProvider {
                     last_error = Some(e);
                     sleep(Self::retry_delay(attempt)).await;
                     continue;
+                }
+            };
+
+            // 动态注入凭据的 profileArn 到请求体（仅对 IdC 凭据）
+            // 这确保了 IdC 凭据能够使用其对应的 profileArn
+            // Social 凭据保持原有模式，不做特殊处理
+            let final_request_body = match Self::inject_profile_arn_for_idc(
+                request_body,
+                &ctx.credentials.profile_arn,
+                &ctx.credentials.auth_method,
+            ) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!(
+                        "注入 profileArn 失败（尝试 {}/{}，credential_id={}）: {}",
+                        attempt + 1,
+                        max_retries,
+                        ctx.id,
+                        e
+                    );
+                    // 注入失败时使用原始请求体
+                    request_body.to_string()
                 }
             };
 
@@ -281,7 +306,7 @@ impl KiroProvider {
             let response = match client
                 .post(&url)
                 .headers(headers)
-                .body(request_body.to_string())
+                .body(final_request_body)
                 .send()
                 .await
             {
@@ -490,6 +515,47 @@ impl KiroProvider {
             .pointer("/error/reason")
             .and_then(|v| v.as_str())
             .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    }
+
+    /// 将凭据的 profileArn 注入到请求体中（仅对 IdC 凭据）
+    ///
+    /// 对于 IdC 凭据，每个凭据可能有不同的 profileArn，
+    /// 此方法确保请求体中使用的是当前凭据对应的 profileArn。
+    ///
+    /// 对于 Social 凭据，保持原有模式，不做特殊处理。
+    fn inject_profile_arn_for_idc(
+        request_body: &str,
+        profile_arn: &Option<String>,
+        auth_method: &Option<String>,
+    ) -> anyhow::Result<String> {
+        // 仅对 IdC 凭据做特殊处理
+        let is_idc = auth_method
+            .as_ref()
+            .map(|m| m.to_lowercase() == "idc")
+            .unwrap_or(false);
+
+        if !is_idc {
+            // Social 凭据保持原有模式
+            return Ok(request_body.to_string());
+        }
+
+        // 如果 IdC 凭据没有 profileArn，直接返回原始请求体
+        let Some(arn) = profile_arn else {
+            return Ok(request_body.to_string());
+        };
+
+        // 解析请求体为 JSON
+        let mut json: serde_json::Value = serde_json::from_str(request_body)
+            .map_err(|e| anyhow::anyhow!("解析请求体 JSON 失败: {}", e))?;
+
+        // 注入 profileArn
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("profileArn".to_string(), serde_json::Value::String(arn.clone()));
+        }
+
+        // 序列化回字符串
+        serde_json::to_string(&json)
+            .map_err(|e| anyhow::anyhow!("序列化请求体 JSON 失败: {}", e))
     }
 }
 
