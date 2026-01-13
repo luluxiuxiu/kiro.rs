@@ -1220,7 +1220,7 @@ impl MultiTokenManager {
         let idp = updated_creds
             .provider
             .as_deref()
-            .unwrap_or("Github");
+            .unwrap_or("Google");
 
         // 调用 Web Portal API
         let info = crate::kiro::web_portal::get_account_aggregate_info(
