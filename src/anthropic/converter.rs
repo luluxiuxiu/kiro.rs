@@ -626,7 +626,6 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
 
     tools
         .iter()
-        .filter(|t| !is_unsupported_tool(&t.name))
         .map(|t| {
             let description = t.description.clone();
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
@@ -644,12 +643,6 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
             }
         })
         .collect()
-}
-
-/// 检查是否为不支持的工具
-fn is_unsupported_tool(name: &str) -> bool {
-    // matches!(name.to_lowercase().as_str(), "web_search" | "websearch")
-    false
 }
 
 /// 生成thinking标签前缀
@@ -829,13 +822,6 @@ fn convert_assistant_message(
                             }
                         }
                         "tool_use" => {
-                            // 过滤不支持的工具
-                            if let Some(ref name) = block.name {
-                                if is_unsupported_tool(name) {
-                                    continue;
-                                }
-                            }
-
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 tool_uses.push(ToolUseEntry::new(id, name).with_input(input));
@@ -851,6 +837,7 @@ fn convert_assistant_message(
 
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
+    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
     let final_content = if !thinking_content.is_empty() {
         if !text_content.is_empty() {
             format!(
@@ -860,6 +847,8 @@ fn convert_assistant_message(
         } else {
             format!("<thinking>{}</thinking>", thinking_content)
         }
+    } else if text_content.is_empty() && !tool_uses.is_empty() {
+        "There is a tool use.".to_string()
     } else {
         text_content
     };
@@ -925,14 +914,6 @@ mod tests {
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
-    }
-
-    #[test]
-    fn test_is_unsupported_tool() {
-        assert!(is_unsupported_tool("web_search"));
-        assert!(is_unsupported_tool("websearch"));
-        assert!(is_unsupported_tool("WebSearch"));
-        assert!(!is_unsupported_tool("read_file"));
     }
 
     #[test]
@@ -1343,5 +1324,70 @@ mod tests {
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_tool_use_only() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试仅包含 tool_use 的 assistant 消息（无 text 块）
+        // Kiro API 要求 content 字段不能为空
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "toolu_01ABC", "name": "read_file", "input": {"path": "/test.txt"}}
+            ]),
+        };
+
+        let result = convert_assistant_message(&msg).expect("应该成功转换");
+
+        // 验证 content 不为空（使用占位符）
+        assert!(
+            !result.assistant_response_message.content.is_empty(),
+            "content 不应为空"
+        );
+        assert_eq!(
+            result.assistant_response_message.content, "There is a tool use.",
+            "仅 tool_use 时应使用 'There is a tool use.' 占位符"
+        );
+
+        // 验证 tool_uses 被正确保留
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应该有 tool_uses");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+        assert_eq!(tool_uses[0].name, "read_file");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_with_text_and_tool_use() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试同时包含 text 和 tool_use 的 assistant 消息
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "Let me read that file for you."},
+                {"type": "tool_use", "id": "toolu_02XYZ", "name": "read_file", "input": {"path": "/data.json"}}
+            ]),
+        };
+
+        let result = convert_assistant_message(&msg).expect("应该成功转换");
+
+        // 验证 content 使用原始文本（不是占位符）
+        assert_eq!(
+            result.assistant_response_message.content,
+            "Let me read that file for you."
+        );
+
+        // 验证 tool_uses 被正确保留
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应该有 tool_uses");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
     }
 }

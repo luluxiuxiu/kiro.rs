@@ -111,7 +111,7 @@ pub struct UsageBreakdown {
 
     /// 额外用量包（如 GIFT 类型）
     #[serde(default)]
-    pub bonuses: Option<Vec<Bonus>>,
+    pub bonuses: Vec<Bonus>,
 
     /// 资源类型 (CREDIT 等)
     #[serde(default)]
@@ -274,14 +274,10 @@ impl UsageLimitsResponse {
         // 合并所有激活的 bonuses 额度
         let bonuses_limit: f64 = breakdown
             .bonuses
-            .as_ref()
-            .map(|bs| {
-                bs.iter()
-                    .filter(|b| b.is_active())
-                    .map(|b| b.usage_limit_with_precision)
-                    .sum()
-            })
-            .unwrap_or(0.0);
+            .iter()
+            .filter(|b| b.is_active())
+            .map(|b| b.usage_limit_with_precision)
+            .sum();
 
         base_limit + free_trial_limit + bonuses_limit
     }
@@ -307,14 +303,10 @@ impl UsageLimitsResponse {
         // 合并所有激活的 bonuses 使用量
         let bonuses_usage: f64 = breakdown
             .bonuses
-            .as_ref()
-            .map(|bs| {
-                bs.iter()
-                    .filter(|b| b.is_active())
-                    .map(|b| b.current_usage_with_precision)
-                    .sum()
-            })
-            .unwrap_or(0.0);
+            .iter()
+            .filter(|b| b.is_active())
+            .map(|b| b.current_usage_with_precision)
+            .sum();
 
         base_usage + free_trial_usage + bonuses_usage
     }
