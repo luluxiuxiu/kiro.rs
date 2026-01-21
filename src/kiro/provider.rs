@@ -13,11 +13,9 @@ use uuid::Uuid;
 
 use crate::http_client::{build_client, build_stream_client, ProxyConfig};
 use crate::kiro::machine_id;
+use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::stats::StatsStore;
-
-#[cfg(test)]
-use crate::kiro::model::credentials::KiroCredentials;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -76,7 +74,7 @@ impl KiroProvider {
         &self.token_manager
     }
 
-    /// 获取 API 基础 URL
+    /// 获取 API 基础 URL（使用全局 region）
     pub fn base_url(&self) -> String {
         format!(
             "https://q.{}.amazonaws.com/generateAssistantResponse",
@@ -84,7 +82,19 @@ impl KiroProvider {
         )
     }
 
-    /// 获取 MCP API URL
+    /// 获取 API 基础 URL（优先使用凭据级 region）
+    fn base_url_for_credential(&self, credentials: &KiroCredentials) -> String {
+        let region = credentials
+            .region
+            .as_ref()
+            .unwrap_or(&self.token_manager.config().region);
+        format!(
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            region
+        )
+    }
+
+    /// 获取 MCP API URL（使用全局 region）
     pub fn mcp_url(&self) -> String {
         format!(
             "https://q.{}.amazonaws.com/mcp",
@@ -92,9 +102,27 @@ impl KiroProvider {
         )
     }
 
-    /// 获取 API 基础域名
+    /// 获取 MCP API URL（优先使用凭据级 region）
+    fn mcp_url_for_credential(&self, credentials: &KiroCredentials) -> String {
+        let region = credentials
+            .region
+            .as_ref()
+            .unwrap_or(&self.token_manager.config().region);
+        format!("https://q.{}.amazonaws.com/mcp", region)
+    }
+
+    /// 获取 API 基础域名（使用全局 region）
     pub fn base_domain(&self) -> String {
         format!("q.{}.amazonaws.com", self.token_manager.config().region)
+    }
+
+    /// 获取 API 基础域名（优先使用凭据级 region）
+    fn base_domain_for_credential(&self, credentials: &KiroCredentials) -> String {
+        let region = credentials
+            .region
+            .as_ref()
+            .unwrap_or(&self.token_manager.config().region);
+        format!("q.{}.amazonaws.com", region)
     }
 
     /// 构建请求头
@@ -138,7 +166,7 @@ impl KiroProvider {
         );
         headers.insert(
             HOST,
-            HeaderValue::from_str(&self.base_domain())
+            HeaderValue::from_str(&self.base_domain_for_credential(&ctx.credentials))
                 .map_err(|e| anyhow::anyhow!("Host header 无效: {}", e))?,
         );
         headers.insert(
@@ -187,7 +215,7 @@ impl KiroProvider {
             HeaderValue::from_str(&x_amz_user_agent).unwrap(),
         );
         headers.insert("user-agent", HeaderValue::from_str(&user_agent).unwrap());
-        headers.insert("host", HeaderValue::from_str(&self.base_domain()).unwrap());
+        headers.insert("host", HeaderValue::from_str(&self.base_domain_for_credential(&ctx.credentials)).unwrap());
         headers.insert(
             "amz-sdk-invocation-id",
             HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
@@ -288,7 +316,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.mcp_url();
+            let url = self.mcp_url_for_credential(&ctx.credentials);
             let headers = match self.build_mcp_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -455,7 +483,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.base_url();
+            let url = self.base_url_for_credential(&ctx.credentials);
             let headers = match self.build_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -560,6 +588,26 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                // 特殊处理：内容长度超限错误
+                if Self::is_content_length_exceeded(&body) {
+                    tracing::warn!(
+                        "内容长度超过限制，将返回特殊错误以触发 Claude Code 压缩: {}",
+                        body
+                    );
+
+                    if let Some(stats) = &self.stats {
+                        stats.record_error(
+                            ctx.id,
+                            model,
+                            truncate_error("内容长度超限 (CONTENT_LENGTH_EXCEEDS_THRESHOLD)".to_string()),
+                        );
+                    }
+
+                    // 返回特殊错误标记，让上层识别并返回 stop_reason=max_tokens
+                    anyhow::bail!("ContentLengthExceeded: Input is too long (CONTENT_LENGTH_EXCEEDS_THRESHOLD)");
+                }
+
+                // 其他 400 错误正常处理
                 if let Some(stats) = &self.stats {
                     stats.record_error(
                         ctx.id,
@@ -712,6 +760,32 @@ impl KiroProvider {
             .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
     }
 
+    /// 检查是否为内容长度超限错误
+    ///
+    /// 识别 Kiro API 返回的 CONTENT_LENGTH_EXCEEDS_THRESHOLD 错误
+    fn is_content_length_exceeded(body: &str) -> bool {
+        if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        if value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        {
+            return true;
+        }
+
+        value
+            .pointer("/error/reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+    }
+
     /// 将凭据的 profileArn 注入到请求体中（仅对 IdC 凭据）
     ///
     /// 对于 IdC 凭据，每个凭据可能有不同的 profileArn，
@@ -860,5 +934,35 @@ mod tests {
     fn test_is_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!KiroProvider::is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_is_content_length_exceeded_detects_reason() {
+        let body = r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        assert!(KiroProvider::is_content_length_exceeded(body));
+    }
+
+    #[test]
+    fn test_is_content_length_exceeded_nested_reason() {
+        let body = r#"{"error":{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}}"#;
+        assert!(KiroProvider::is_content_length_exceeded(body));
+    }
+
+    #[test]
+    fn test_is_content_length_exceeded_contains_string() {
+        let body = "Error: CONTENT_LENGTH_EXCEEDS_THRESHOLD - Input is too long";
+        assert!(KiroProvider::is_content_length_exceeded(body));
+    }
+
+    #[test]
+    fn test_is_content_length_exceeded_false() {
+        let body = r#"{"message":"Other error","reason":"INVALID_REQUEST"}"#;
+        assert!(!KiroProvider::is_content_length_exceeded(body));
+    }
+
+    #[test]
+    fn test_is_content_length_exceeded_invalid_json() {
+        let body = "not a json";
+        assert!(!KiroProvider::is_content_length_exceeded(body));
     }
 }

@@ -210,12 +210,107 @@ async fn handle_stream_request(
     {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::error!("Kiro API 调用失败: {}", e);
+            let error_msg = e.to_string();
+
+            // 检查是否为内容长度超限错误
+            if error_msg.starts_with("ContentLengthExceeded:") {
+                tracing::info!("检测到内容长度超限（流式），返回 stop_reason=max_tokens");
+
+                // 返回一个 SSE 流，包含 stop_reason=max_tokens
+                let model_clone = model.to_string();
+                let stream = stream::iter(vec![
+                    // message_start
+                    Ok::<Bytes, Infallible>(Bytes::from(format!(
+                        "event: message_start\ndata: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "message_start",
+                            "message": {
+                                "id": format!("msg_{}", Uuid::new_v4().simple()),
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "model": &model_clone,
+                                "stop_reason": null,
+                                "stop_sequence": null,
+                                "usage": {
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": 0
+                                }
+                            }
+                        })).unwrap()
+                    ))),
+                    // content_block_start
+                    Ok(Bytes::from(format!(
+                        "event: content_block_start\ndata: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "text",
+                                "text": ""
+                            }
+                        })).unwrap()
+                    ))),
+                    // content_block_delta
+                    Ok(Bytes::from(format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话\n\n提示：Claude Code 可能会自动触发压缩。"
+                            }
+                        })).unwrap()
+                    ))),
+                    // content_block_stop
+                    Ok(Bytes::from(format!(
+                        "event: content_block_stop\ndata: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "content_block_stop",
+                            "index": 0
+                        })).unwrap()
+                    ))),
+                    // message_delta - 关键：包含 stop_reason=max_tokens
+                    Ok(Bytes::from(format!(
+                        "event: message_delta\ndata: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": "max_tokens",  // 触发 Claude Code 压缩
+                                "stop_sequence": null
+                            },
+                            "usage": {
+                                "output_tokens": 50
+                            }
+                        })).unwrap()
+                    ))),
+                    // message_stop
+                    Ok(Bytes::from(format!(
+                        "event: message_stop\ndata: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "message_stop"
+                        })).unwrap()
+                    ))),
+                ]);
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+                    .into_response();
+            }
+
+            // 其他错误返回 502
+            tracing::error!("Kiro API 调用失败: {}", error_msg);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", e),
+                    format!("上游 API 调用失败: {}", error_msg),
                 )),
             )
                 .into_response();
@@ -563,12 +658,41 @@ async fn handle_non_stream_request(
     {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::error!("Kiro API 调用失败: {}", e);
+            let error_msg = e.to_string();
+
+            // 检查是否为内容长度超限错误
+            if error_msg.starts_with("ContentLengthExceeded:") {
+                tracing::info!("检测到内容长度超限，返回 stop_reason=max_tokens 以触发 Claude Code 压缩");
+
+                // 返回一个成功的响应，但 stop_reason 为 max_tokens
+                // 这会触发 Claude Code 的自动压缩机制
+                let response_body = json!({
+                    "id": format!("msg_{}", Uuid::new_v4().simple()),
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话\n\n提示：Claude Code 可能会自动触发压缩。"
+                    }],
+                    "model": model,
+                    "stop_reason": "max_tokens",  // 关键：触发 Claude Code 压缩
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 50
+                    }
+                });
+
+                return (StatusCode::OK, Json(response_body)).into_response();
+            }
+
+            // 其他错误返回 502
+            tracing::error!("Kiro API 调用失败: {}", error_msg);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", e),
+                    format!("上游 API 调用失败: {}", error_msg),
                 )),
             )
                 .into_response();
