@@ -298,7 +298,132 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
+    // 如果凭据没有 profileArn，自动调用 ListAvailableProfiles 获取
+    if new_credentials.profile_arn.is_none() {
+        tracing::info!("IdC 凭据缺少 profileArn，正在调用 ListAvailableProfiles 自动获取...");
+        match fetch_profile_arn_for_idc(&new_credentials, config, proxy).await {
+            Ok(Some(arn)) => {
+                tracing::info!("成功获取 profileArn: {}", arn);
+                new_credentials.profile_arn = Some(arn);
+            }
+            Ok(None) => {
+                tracing::warn!("ListAvailableProfiles 返回空列表，无法获取 profileArn");
+            }
+            Err(e) => {
+                tracing::warn!("获取 profileArn 失败（不影响 Token 刷新）: {}", e);
+            }
+        }
+    }
+
     Ok(new_credentials)
+}
+
+/// ListAvailableProfiles API 所需的 x-amz-user-agent header 前缀
+const LIST_PROFILES_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-js/1.0.0";
+
+/// 为 IdC 凭据获取 profileArn
+///
+/// 调用 ListAvailableProfiles API 获取该凭据可用的 profile，
+/// 返回第一个可用的 profileArn。
+pub(crate) async fn fetch_profile_arn_for_idc(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
+
+    let token = credentials
+        .access_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("缺少 access_token"))?;
+
+    // 使用 config.region 作为 API 调用的 region
+    let region = &config.region;
+    let host = format!("q.{}.amazonaws.com", region);
+    // 注意：路径是 /ListAvailableProfiles（大写 L）
+    let url = format!("https://{}/ListAvailableProfiles", host);
+
+    let machine_id = crate::kiro::machine_id::generate_from_credentials(credentials, config)
+        .unwrap_or_else(|| "unknown".to_string());
+    let kiro_version = &config.kiro_version;
+
+    let x_amz_user_agent = format!("{} KiroIDE-{}-{}", LIST_PROFILES_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id);
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, kiro_version, machine_id
+    );
+
+    tracing::info!(
+        "[ListAvailableProfiles] 开始获取 profileArn\n\
+         URL: {}\n\
+         Token 长度: {} 字符",
+        url,
+        token.len()
+    );
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let invocation_id = uuid::Uuid::new_v4().to_string();
+
+    // POST 请求，请求体为空 JSON 对象 {}
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", &x_amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", &invocation_id)
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .body("{}")
+        .send()
+        .await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        tracing::warn!(
+            "[ListAvailableProfiles] 请求失败: HTTP {} - {}",
+            status,
+            body_text
+        );
+        bail!("ListAvailableProfiles 失败: {} {}", status, body_text);
+    }
+
+    let body_text = response.text().await.unwrap_or_default();
+    tracing::info!(
+        "[ListAvailableProfiles] 请求成功: HTTP {} - 响应长度 {} 字节",
+        status,
+        body_text.len()
+    );
+
+    let data: ListAvailableProfilesResponse = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow::anyhow!("解析 ListAvailableProfiles 响应失败: {}", e))?;
+
+    // 返回第一个有效的 profileArn
+    if let Some(profiles) = data.profiles {
+        tracing::info!("[ListAvailableProfiles] 获取到 {} 个 profile", profiles.len());
+        for (i, profile) in profiles.iter().enumerate() {
+            tracing::debug!(
+                "[ListAvailableProfiles] profile[{}]: arn={:?}, name={:?}",
+                i,
+                profile.arn,
+                profile.profile_name
+            );
+            if let Some(arn) = &profile.arn {
+                if !arn.is_empty() {
+                    tracing::info!("[ListAvailableProfiles] 选择 profileArn: {}", arn);
+                    return Ok(Some(arn.clone()));
+                }
+            }
+        }
+    } else {
+        tracing::warn!("[ListAvailableProfiles] 响应中没有 profiles 字段");
+    }
+
+    tracing::warn!("[ListAvailableProfiles] 未找到有效的 profileArn");
+    Ok(None)
 }
 
 /// getUsageLimits API 所需的 x-amz-user-agent header 前缀
@@ -661,6 +786,120 @@ impl MultiTokenManager {
         }
 
         Ok(manager)
+    }
+
+    /// 启动时为缺少 profileArn 的 IdC 凭据尝试获取
+    ///
+    /// 对每个缺少 profileArn 的 IdC 凭据，最多尝试 3 次获取
+    /// 成功获取后会持久化到配置文件
+    pub async fn fetch_missing_profile_arns(&self) {
+        // 收集需要获取 profileArn 的 IdC 凭据
+        let idc_credentials_without_arn: Vec<(u64, KiroCredentials)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| {
+                    let is_idc = e.credentials
+                        .auth_method
+                        .as_ref()
+                        .map(|m| m.eq_ignore_ascii_case("idc"))
+                        .unwrap_or(false)
+                        || (e.credentials.client_id.is_some() && e.credentials.client_secret.is_some());
+                    is_idc && e.credentials.profile_arn.is_none()
+                })
+                .map(|e| (e.id, e.credentials.clone()))
+                .collect()
+        };
+
+        if idc_credentials_without_arn.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "[启动初始化] 发现 {} 个 IdC 凭据缺少 profileArn，开始尝试获取...",
+            idc_credentials_without_arn.len()
+        );
+
+        let mut updated_count = 0;
+        const MAX_RETRIES: u32 = 3;
+
+        for (id, cred) in idc_credentials_without_arn {
+            // 检查凭据是否有有效的 access_token
+            if cred.access_token.is_none() {
+                tracing::warn!(
+                    "[启动初始化] 凭据 #{} 没有 access_token，跳过 profileArn 获取",
+                    id
+                );
+                continue;
+            }
+
+            let mut success = false;
+            for attempt in 1..=MAX_RETRIES {
+                tracing::info!(
+                    "[启动初始化] 凭据 #{} 尝试获取 profileArn（第 {}/{} 次）",
+                    id, attempt, MAX_RETRIES
+                );
+
+                match fetch_profile_arn_for_idc(&cred, &self.config, self.proxy.as_ref()).await {
+                    Ok(Some(arn)) => {
+                        tracing::info!(
+                            "[启动初始化] 凭据 #{} 成功获取 profileArn: {}",
+                            id, arn
+                        );
+                        // 更新凭据
+                        {
+                            let mut entries = self.entries.lock();
+                            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                                entry.credentials.profile_arn = Some(arn);
+                            }
+                        }
+                        success = true;
+                        updated_count += 1;
+                        break;
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "[启动初始化] 凭据 #{} 未找到可用的 profileArn（第 {}/{} 次）",
+                            id, attempt, MAX_RETRIES
+                        );
+                        // 没有可用的 profile，不需要重试
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[启动初始化] 凭据 #{} 获取 profileArn 失败（第 {}/{} 次）: {}",
+                            id, attempt, MAX_RETRIES, e
+                        );
+                        if attempt < MAX_RETRIES {
+                            // 等待一小段时间后重试
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            }
+
+            if !success {
+                tracing::warn!(
+                    "[启动初始化] 凭据 #{} 获取 profileArn 失败，已达到最大重试次数",
+                    id
+                );
+            }
+        }
+
+        // 如果有更新，持久化到配置文件
+        if updated_count > 0 {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!(
+                    "[启动初始化] 持久化 profileArn 更新失败: {}",
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "[启动初始化] 已成功获取并持久化 {} 个凭据的 profileArn",
+                    updated_count
+                );
+            }
+        }
     }
 
     /// 获取配置的引用
@@ -1513,6 +1752,30 @@ impl MultiTokenManager {
         validated_cred.region = new_cred.region;
         validated_cred.machine_id = new_cred.machine_id;
 
+        // 5. 如果是 IdC 凭据且缺少 profileArn，尝试获取
+        let is_idc = validated_cred
+            .auth_method
+            .as_ref()
+            .map(|m| m.eq_ignore_ascii_case("idc"))
+            .unwrap_or(false)
+            || (validated_cred.client_id.is_some() && validated_cred.client_secret.is_some());
+
+        if is_idc && validated_cred.profile_arn.is_none() {
+            tracing::info!("新添加的 IdC 凭据 #{} 缺少 profileArn，正在尝试获取...", new_id);
+            match fetch_profile_arn_for_idc(&validated_cred, &self.config, self.proxy.as_ref()).await {
+                Ok(Some(arn)) => {
+                    tracing::info!("凭据 #{} 成功获取 profileArn: {}", new_id, arn);
+                    validated_cred.profile_arn = Some(arn);
+                }
+                Ok(None) => {
+                    tracing::warn!("凭据 #{} 未找到可用的 profileArn", new_id);
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 获取 profileArn 失败: {}", new_id, e);
+                }
+            }
+        }
+
         {
             let mut entries = self.entries.lock();
             entries.push(CredentialEntry {
@@ -1524,7 +1787,7 @@ impl MultiTokenManager {
             });
         }
 
-        // 5. 持久化
+        // 6. 持久化
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);

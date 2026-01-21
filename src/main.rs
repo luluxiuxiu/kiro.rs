@@ -218,6 +218,10 @@ async fn run() -> AppResult<()> {
         is_multiple_format,
     )
     .context("创建 Token 管理器失败")?;
+
+    // 启动时为缺少 profileArn 的 IdC 凭据尝试获取
+    token_manager.fetch_missing_profile_arns().await;
+
     let token_manager = Arc::new(token_manager);
 
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone())
