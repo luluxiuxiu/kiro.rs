@@ -441,12 +441,11 @@ impl SseStateManager {
     }
 }
 
-/// 上下文窗口大小（200k tokens）
+/// Claude Code 上下文窗口大小（200k tokens）
 const CONTEXT_WINDOW_SIZE: i32 = 200_000;
 
-/// 触发自动压缩的上下文使用率阈值（百分比）
-/// 当 contextUsagePercentage 超过此值时记录日志
-const AUTO_COMPACT_THRESHOLD: f64 = 85.0;
+/// 输出警告的上下文使用率阈值（百分比）
+const CONTEXT_WARNING_THRESHOLD: f64 = 80.0;
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -579,30 +578,38 @@ impl StreamContext {
                 // 保存上下文使用百分比
                 self.context_usage_percentage = Some(context_usage.context_usage_percentage);
                 
-                // 从上下文使用百分比计算实际的 input_tokens
-                // 公式: percentage * 200000 / 100 = percentage * 2000
-                let actual_input_tokens = (context_usage.context_usage_percentage
+                // 用 200K 窗口计算实际使用的 tokens
+                // 公式: percentage * 200000 / 100
+                let actual_tokens = (context_usage.context_usage_percentage
                     * (CONTEXT_WINDOW_SIZE as f64)
                     / 100.0) as i32;
                 
-                // 直接使用远程返回的上下文使用率计算的 input_tokens
-                // 不再强制只增不减，因为 /compact 后上下文会变小
-                self.context_input_tokens = Some(actual_input_tokens);
-                
-                // 记录上下文使用情况
-                if context_usage.context_usage_percentage >= AUTO_COMPACT_THRESHOLD {
-                    tracing::info!(
-                        "上下文使用率 {:.1}% 超过阈值 {:.1}%",
-                        context_usage.context_usage_percentage,
-                        AUTO_COMPACT_THRESHOLD
-                    );
-                }
+                self.context_input_tokens = Some(actual_tokens);
                 
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                    "contextUsageEvent: {:.1}% -> {} tokens",
                     context_usage.context_usage_percentage,
-                    actual_input_tokens
+                    actual_tokens
                 );
+                
+                // 当上下文使用率 >= 80% 时，插入一条警告消息给 Claude Code 显示
+                if context_usage.context_usage_percentage >= CONTEXT_WARNING_THRESHOLD {
+                    tracing::warn!(
+                        "上下文使用率 {:.1}% 超过阈值，插入警告消息",
+                        context_usage.context_usage_percentage
+                    );
+                    
+                    // 创建警告文本
+                    let warning_text = format!(
+                        "\n\n⚠️ **上下文告急**: 当前使用率 {:.1}% ({} / 200K tokens)，建议使用 `/compact` 压缩对话历史。\n\n",
+                        context_usage.context_usage_percentage,
+                        actual_tokens
+                    );
+                    
+                    // 返回一个 text_delta 事件
+                    return self.create_text_delta_events(&warning_text);
+                }
+                
                 Vec::new()
             }
             Event::Error {

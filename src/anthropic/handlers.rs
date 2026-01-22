@@ -229,9 +229,9 @@ async fn handle_stream_request(
 
             // 检查是否为内容长度超限错误
             if error_msg.starts_with("ContentLengthExceeded:") {
-                tracing::info!("检测到内容长度超限（流式），返回 stop_reason=max_tokens");
+                tracing::info!("检测到内容长度超限（流式），返回提示信息");
 
-                // 返回一个 SSE 流，包含 stop_reason=max_tokens
+                // 返回一个 SSE 流，包含提示信息
                 let model_clone = model.to_string();
                 let stream = stream::iter(vec![
                     // message_start
@@ -274,7 +274,7 @@ async fn handle_stream_request(
                             "index": 0,
                             "delta": {
                                 "type": "text_delta",
-                                "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话\n\n提示：Claude Code 可能会自动触发压缩。"
+                                "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话"
                             }
                         })).unwrap()
                     ))),
@@ -286,17 +286,18 @@ async fn handle_stream_request(
                             "index": 0
                         })).unwrap()
                     ))),
-                    // message_delta - 关键：包含 stop_reason=max_tokens
+                    // message_delta - 正常结束，返回真实的 input_tokens
                     Ok(Bytes::from(format!(
                         "event: message_delta\ndata: {}\n\n",
                         serde_json::to_string(&json!({
                             "type": "message_delta",
                             "delta": {
-                                "stop_reason": "max_tokens",  // 触发 Claude Code 压缩
+                                "stop_reason": "end_turn",
                                 "stop_sequence": null
                             },
                             "usage": {
-                                "output_tokens": 50
+                                "input_tokens": input_tokens,
+                                "output_tokens": 100
                             }
                         })).unwrap()
                     ))),
@@ -684,11 +685,11 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 上下文窗口大小（200k tokens）
+/// Claude Code 上下文窗口大小（200k tokens）
 const CONTEXT_WINDOW_SIZE: i32 = 200_000;
 
-/// 触发自动压缩的上下文使用率阈值（百分比）
-const AUTO_COMPACT_THRESHOLD: f64 = 85.0;
+/// 输出警告的上下文使用率阈值（百分比）
+const CONTEXT_WARNING_THRESHOLD: f64 = 80.0;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -710,24 +711,23 @@ async fn handle_non_stream_request(
 
             // 检查是否为内容长度超限错误
             if error_msg.starts_with("ContentLengthExceeded:") {
-                tracing::info!("检测到内容长度超限，返回 stop_reason=max_tokens 以触发 Claude Code 压缩");
+                tracing::info!("检测到内容长度超限，返回提示信息");
 
-                // 返回一个成功的响应，但 stop_reason 为 max_tokens
-                // 这会触发 Claude Code 的自动压缩机制
+                // 返回一个成功的响应，包含提示信息和真实的 input_tokens
                 let response_body = json!({
                     "id": format!("msg_{}", Uuid::new_v4().simple()),
                     "type": "message",
                     "role": "assistant",
                     "content": [{
                         "type": "text",
-                        "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话\n\n提示：Claude Code 可能会自动触发压缩。"
+                        "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话"
                     }],
                     "model": model,
-                    "stop_reason": "max_tokens",  // 关键：触发 Claude Code 压缩
+                    "stop_reason": "end_turn",
                     "stop_sequence": null,
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": 50
+                        "output_tokens": 100
                     }
                 });
 
@@ -841,30 +841,28 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            // 公式: percentage * 200000 / 100 = percentage * 2000
-                            let actual_input_tokens = (context_usage.context_usage_percentage
+                            // 用 200K 窗口计算实际使用的 tokens
+                            // 公式: percentage * 200000 / 100
+                            let actual_tokens = (context_usage.context_usage_percentage
                                 * (CONTEXT_WINDOW_SIZE as f64)
                                 / 100.0)
                                 as i32;
                             
-                            // 直接使用远程返回的上下文使用率计算的 input_tokens
-                            // 不再强制只增不减，因为 /compact 后上下文会变小
-                            context_input_tokens = Some(actual_input_tokens);
+                            context_input_tokens = Some(actual_tokens);
                             
-                            // 记录上下文使用情况
-                            if context_usage.context_usage_percentage >= AUTO_COMPACT_THRESHOLD {
-                                tracing::info!(
-                                    "上下文使用率 {:.1}% 超过阈值 {:.1}%",
+                            // 当上下文使用率 >= 80% 时输出警告
+                            if context_usage.context_usage_percentage >= CONTEXT_WARNING_THRESHOLD {
+                                tracing::warn!(
+                                    "⚠️ 上下文使用率较高: {:.1}% (约 {} tokens / 200K)",
                                     context_usage.context_usage_percentage,
-                                    AUTO_COMPACT_THRESHOLD
+                                    actual_tokens
                                 );
                             }
                             
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                "contextUsageEvent: {:.1}% -> {} tokens",
                                 context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                actual_tokens
                             );
                         }
                         Event::Exception { exception_type, .. } => {
