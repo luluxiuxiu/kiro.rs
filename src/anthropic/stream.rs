@@ -481,6 +481,10 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
+    /// 是否收到上游错误事件（用于触发重试）
+    pub received_upstream_error: bool,
+    /// 上游错误消息
+    pub upstream_error_message: Option<String>,
 }
 
 impl StreamContext {
@@ -507,6 +511,8 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
+            received_upstream_error: false,
+            upstream_error_message: None,
         }
     }
 
@@ -617,6 +623,9 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                // 标记收到上游错误，用于触发重试
+                self.received_upstream_error = true;
+                self.upstream_error_message = Some(format!("{}: {}", error_code, error_message));
                 Vec::new()
             }
             Event::Exception {
@@ -624,6 +633,9 @@ impl StreamContext {
                 message,
             } => {
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                // 标记收到上游错误，用于触发重试
+                self.received_upstream_error = true;
+                self.upstream_error_message = Some(format!("{}: {}", exception_type, message));
                 Vec::new()
             }
             _ => Vec::new(),
@@ -1071,6 +1083,7 @@ impl StreamContext {
             context_input_tokens = ?self.context_input_tokens,
             final_input_tokens = final_input_tokens,
             final_output_tokens = final_output_tokens,
+            received_upstream_error = self.received_upstream_error,
             "流结束，返回给 Claude Code 的 usage"
         );
 

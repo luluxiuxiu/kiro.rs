@@ -704,9 +704,48 @@ fn create_sse_stream(
                     }
                     None => {
                         // 流正常结束（EOF）
-                        // 注意：正常EOF不触发重试，即使输出很短
-                        // 只有流读取出错（Some(Err)）时才考虑重试
+                        // 检查是否收到上游错误事件，如果是则尝试重试或返回错误
+                        let received_error = state.ctx.received_upstream_error;
                         let is_abnormally_short = state.ctx.output_tokens < STREAM_RETRY_MIN_OUTPUT_TOKENS;
+                        
+                        // 当收到上游错误事件且输出很短时，返回 SSE error 事件让 Claude Code 重试
+                        if received_error && is_abnormally_short {
+                            let error_msg = state.ctx.upstream_error_message
+                                .as_deref()
+                                .unwrap_or("Upstream service error");
+                            
+                            tracing::warn!(
+                                message_id = %state.ctx.message_id,
+                                output_tokens = state.ctx.output_tokens,
+                                error_message = error_msg,
+                                "收到上游错误事件且输出异常短，返回 SSE error 让 Claude Code 重试"
+                            );
+
+                            // 记录错误
+                            if let Some(s) = &state.stats {
+                                s.record_error(
+                                    state.credential_id,
+                                    Some(&state.model),
+                                    format!("上游错误: {}", error_msg),
+                                );
+                            }
+
+                            state.finished = true;
+                            
+                            // 返回 SSE error 事件，Claude Code 会自动重试
+                            let error_event = format!(
+                                "event: error\ndata: {}\n\n",
+                                serde_json::json!({
+                                    "type": "error",
+                                    "error": {
+                                        "type": "api_error",
+                                        "message": error_msg
+                                    }
+                                })
+                            );
+                            let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(error_event))];
+                            return Some((stream::iter(bytes), state));
+                        }
 
                         if is_abnormally_short {
                             tracing::warn!(
@@ -715,6 +754,7 @@ fn create_sse_stream(
                                 input_tokens = state.ctx.input_tokens,
                                 decoded_frames = state.decoder.frames_decoded(),
                                 retry_count = state.retry_count,
+                                received_upstream_error = received_error,
                                 "检测到异常短响应，上游API可能提前终止。建议检查：1)上游服务状态 2)Token额度 3)请求频率限制"
                             );
                         }
@@ -728,6 +768,7 @@ fn create_sse_stream(
                             decoder_bytes_skipped = state.decoder.bytes_skipped(),
                             retry_count = state.retry_count,
                             abnormally_short = is_abnormally_short,
+                            received_upstream_error = received_error,
                             "上游响应流结束（EOF）"
                         );
 
