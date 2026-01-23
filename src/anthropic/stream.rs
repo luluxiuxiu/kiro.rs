@@ -224,13 +224,13 @@ impl BlockState {
 #[derive(Debug)]
 pub struct SseStateManager {
     /// message_start 是否已发送
-    message_started: bool,
+    pub message_started: bool,
     /// message_delta 是否已发送
-    message_delta_sent: bool,
+    pub message_delta_sent: bool,
     /// 活跃的内容块状态
     active_blocks: HashMap<i32, BlockState>,
     /// 消息是否已结束
-    message_ended: bool,
+    pub message_ended: bool,
     /// 下一个块索引
     next_block_index: i32,
     /// 当前 stop_reason
@@ -385,6 +385,32 @@ impl SseStateManager {
             ));
         }
         None
+    }
+
+    /// 生成中间状态的 message_delta (仅包含 usage)
+    /// 用于在流过程中实时反馈 token 使用情况
+    pub fn handle_message_delta_usage(
+        &mut self,
+        input_tokens: i32,
+        output_tokens: i32,
+    ) -> Option<SseEvent> {
+        // 注意：这里不设置 self.message_delta_sent = true
+        // 因为这是一个中间状态的 delta，最终的 delta (带 stop_reason) 还在 generate_final_events 中发送
+        
+        Some(SseEvent::new(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": null,
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens
+                }
+            }),
+        ))
     }
 
     /// 生成最终事件序列
@@ -597,6 +623,19 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_tokens
                 );
+
+                // 立即发送 message_delta 更新 usage
+                // 这对于让 Claude Code 实时感知上下文变化至关重要（例如触发 /compact）
+                // 只有当消息已经开始且未结束时发送
+                if self.state_manager.message_started && !self.state_manager.message_ended {
+                    let usage_delta_event = self.state_manager.handle_message_delta_usage(
+                        actual_tokens,
+                        self.output_tokens // 使用当前的 output_tokens
+                    );
+                    if let Some(event) = usage_delta_event {
+                         return vec![event];
+                    }
+                }
                 
                 // 当上下文使用率 >= 80% 时，插入一条警告消息给 Claude Code 显示
                 if context_usage.context_usage_percentage >= CONTEXT_WARNING_THRESHOLD {

@@ -56,8 +56,9 @@ impl SessionTokenManager {
     
     /// 更新会话的 token 统计
     /// 
-    /// 当远程返回的 context_usage_percentage 对应的 input_tokens 小于当前值时，
-    /// 说明用户执行了 /compact 或上下文被压缩，此时应该接受新的较小值。
+    /// 更新会话的 input_tokens 和 output_tokens。
+    /// input_tokens 代表当前对话的上下文大小，这是一个状态值，可能会因为 /compact 或删除文件而减少。
+    /// 因此，这里不再强制单调递增，而是信任上游返回的最新值（只要它是有效的正数）。
     /// 
     /// 返回最终使用的 (input_tokens, output_tokens)
     pub fn update_tokens(&self, session_id: &str, input_tokens: i32, output_tokens: i32) -> (i32, i32) {
@@ -69,70 +70,42 @@ impl SessionTokenManager {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         
-        let current_input = session.input_tokens.load(Ordering::Acquire);
-        let _last_update = session.last_update_ms.load(Ordering::Acquire);
-        
-        // 如果新的 input_tokens 比当前值小很多（超过 20%），说明可能执行了 /compact
-        // 此时应该接受新的较小值，而不是保持旧的大值
-        let significant_decrease = input_tokens < (current_input * 80 / 100);
-        
-        let final_input = if significant_decrease {
-            // 检测到显著下降，可能是 /compact 后的结果
-            // 直接使用新值
-            tracing::info!(
-                session_id = %session_id,
-                old_input = current_input,
-                new_input = input_tokens,
-                "检测到 input_tokens 显著下降（可能是 /compact），接受新值"
-            );
+        // 直接更新 input_tokens，不强制单调递增
+        // 因为 input_tokens 反映的是"当前上下文大小"，这个值随用户操作（如 /compact）变化是正常的
+        if input_tokens > 0 {
             session.input_tokens.store(input_tokens, Ordering::Release);
-            input_tokens
         } else {
-            // 正常情况：只增不减
-            loop {
-                let current = session.input_tokens.load(Ordering::Acquire);
-                if input_tokens <= current {
-                    break current;
-                }
-                match session.input_tokens.compare_exchange(
-                    current,
-                    input_tokens,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break input_tokens,
-                    Err(_) => continue,
-                }
-            }
-        };
+            // 如果输入值为 0 或负数（可能是错误），则保留旧值或使用 0
+            // 这里选择不做更新，防止异常数据覆盖
+        }
         
-        // output_tokens 在 /compact 后也应该重置
-        let final_output = if significant_decrease {
+        // output_tokens 是本次请求的输出，通常在流结束时累加
+        // 但这里的语义似乎是"会话累计"？
+        // 根据调用点 (handlers.rs)，传入的是 state.ctx.output_tokens，即"本次响应的输出 tokens"
+        // 这里的 SessionTokens 似乎被误用作了"单次请求的缓存"？
+        // 不，SessionTokenManager 的注释说是"跟踪单个 Claude Code 会话"。
+        // 如果是会话级累计，output_tokens 应该累加。
+        // 但看 handlers.rs 的代码：
+        // let (consistent_input, consistent_output) = state.app_state.update_session_tokens(..., state.ctx.output_tokens);
+        // 然后返回给 usage.output_tokens。
+        // Claude API 的 usage.output_tokens 应该是"本次响应"的 token 数。
+        // 所以这里应该直接存储本次的值，或者 SessionTokens 的设计意图就是"最近一次请求的 usage"。
+        // 考虑到 input_tokens 是状态（上下文大小），output_tokens 是事件（本次消耗），
+        // 这里的 update_tokens 实际上是在更新"该会话最近一次的 usage 快照"。
+        
+        // 更新 output_tokens (直接覆盖，因为它是本次请求的计数)
+        if output_tokens >= 0 {
             session.output_tokens.store(output_tokens, Ordering::Release);
-            output_tokens
-        } else {
-            // 正常情况：只增不减
-            loop {
-                let current = session.output_tokens.load(Ordering::Acquire);
-                if output_tokens <= current {
-                    break current;
-                }
-                match session.output_tokens.compare_exchange(
-                    current,
-                    output_tokens,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break output_tokens,
-                    Err(_) => continue,
-                }
-            }
-        };
+        }
         
         // 更新时间戳
         session.last_update_ms.store(now_ms, Ordering::Release);
         
-        (final_input, final_output)
+        // 返回当前存储的值
+        (
+            session.input_tokens.load(Ordering::Acquire),
+            session.output_tokens.load(Ordering::Acquire)
+        )
     }
     
     /// 清理过期的会话（可选，用于内存管理）

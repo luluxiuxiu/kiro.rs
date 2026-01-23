@@ -12,3 +12,6 @@
 /admin-ui/tsconfig.tsbuildinfo
 public/
 /credentials.*
+.ai_workflow/
+findings.md
+progress.md
