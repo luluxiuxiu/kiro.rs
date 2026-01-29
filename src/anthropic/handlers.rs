@@ -1199,11 +1199,21 @@ pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 从 metadata.user_id 中提取会话 ID
+    let session_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|uid| uid.split("__session_").nth(1))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "default".to_string());
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        session_id = %session_id,
         "Received POST /cc/v1/messages request"
     );
 
@@ -1235,7 +1245,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(state, provider, &payload, input_tokens, &session_id).await;
     }
 
     // 转换请求
@@ -1249,6 +1259,9 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidRequest(msg) => {
+                    ("invalid_request_error", msg.clone())
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -1261,7 +1274,7 @@ pub async fn post_messages_cc(
 
     // 构建 Kiro 请求
     let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
+        conversation_state: conversion_result.conversation_state.clone(),
         profile_arn: state.profile_arn.clone(),
     };
 
@@ -1308,8 +1321,17 @@ pub async fn post_messages_cc(
         )
         .await
     } else {
-        // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        // 非流式响应
+        handle_non_stream_request(
+            state,
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            &session_id,
+            conversion_result,
+        )
+        .await
     }
 }
 
