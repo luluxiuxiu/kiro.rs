@@ -161,6 +161,13 @@ async fn run() -> AppResult<()> {
     // 解析命令行参数
     let args = Args::parse();
 
+    // 初始化日志
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     // 加载配置
     let config_path = args
         .config

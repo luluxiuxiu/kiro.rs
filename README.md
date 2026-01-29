@@ -10,6 +10,8 @@
 因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
 如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
 
+**Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，参考 Issue [#22](https://github.com/hank9999/kiro.rs/issues/22) 和 [#49](https://github.com/hank9999/kiro.rs/issues/49) 的说明与临时解决方案（通常与输出过长被截断有关，可尝试调低输出相关 token 上限）
+
 ## 功能特性
 
 - **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
@@ -26,7 +28,7 @@
 
 ## 支持的 API 端点
 
-### Anthropic 兼容 API
+### Anthropic 兼容 API 标准端点 (/v1)
 
 | 端点 | 方法 | 描述          |
 |------|------|-------------|
@@ -51,6 +53,19 @@
 | `/credentials/{id}/stats` | GET | 获取凭据统计详情 |
 | `/credentials/{id}/stats/reset` | POST | 清空指定凭据统计 |
 | `/stats/reset` | POST | 清空全部统计 |
+
+### Claude Code 兼容端点 (/cc/v1)
+
+| 端点 | 方法 | 描述          |
+|------|------|-------------|
+| `/cc/v1/messages` | POST | 创建消息（流式响应会等待上游完成后再返回，确保 `input_tokens` 准确） |
+| `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
+
+> **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
+> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
+> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
+> - 等待期间会每 25 秒发送 `ping` 事件保活
+
 
 ## 快速开始
 
